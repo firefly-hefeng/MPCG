@@ -351,3 +351,101 @@ class SparseAttention(nn.Module):
         
         return output
 
+# ==================== Enhanced Model Architecture ====================
+class SparseTransformerLayer(nn.Module):
+    """Sparse Transformer layer"""
+    
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.sparse_attn = SparseAttention(d_model, n_heads)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        # attention sub-layer
+        attn_out = self.sparse_attn(self.norm1(x), mask)
+        x = x + self.dropout(attn_out)
+        
+        # feed-forward sub-layer
+        ff_out = self.feed_forward(self.norm2(x))
+        x = x + self.dropout(ff_out)
+        
+        return x
+
+
+class EnhancedCodonFormerE(nn.Module):
+    """Enhanced codon optimization Transformer"""
+    
+    def __init__(self, v_aa, v_cd, v_sp, aux_dim=16, d=512, depth=6, heads=8, drop=0.1):
+        super().__init__()
+        self.d_model = d
+        
+        # embedding layers
+        self.e_aa = nn.Embedding(v_aa, d, padding_idx=0)
+        self.e_sp = nn.Embedding(v_sp, d)
+        self.e_aux = nn.Linear(aux_dim, d)
+        
+        # positional encoding
+        self.pos_enc = PosEnc(d)
+        
+        # multi-scale feature extraction
+        self.local_conv = nn.Conv1d(d, d, kernel_size=3, padding=1)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # sparse attention encoder layers
+        self.layers = nn.ModuleList([
+            SparseTransformerLayer(d, heads, drop) for _ in range(depth)
+        ])
+        
+        # biological feature predictors
+        self.gc_predictor = nn.Linear(d, 1)
+        self.structure_predictor = nn.Linear(d, 1)
+        
+        # output projection
+        self.proj = nn.Linear(d, v_cd)
+        
+        # feature extractor
+        self.feature_extractor = BiologicalFeatureExtractor()
+        
+    def forward(self, aa, mask, sp, aux, return_features=False):
+        B, L = aa.shape
+        
+        # base embedding
+        h = self.e_aa(aa) + self.pos_enc(aa)
+        
+        # species and auxiliary feature embeddings
+        h = h + self.e_sp(sp).unsqueeze(1).expand(-1, L, -1)
+        h = h + self.e_aux(aux).unsqueeze(1).expand(-1, L, -1)
+        
+        # multi-scale features
+        h_conv = self.local_conv(h.transpose(1, 2)).transpose(1, 2)
+        h_global = self.global_pool(h.transpose(1, 2)).transpose(1, 2).expand(-1, L, -1)
+        h = h + 0.1 * h_conv + 0.05 * h_global
+        
+        # sparse attention encoder
+        for layer in self.layers:
+            h = layer(h, mask)
+        
+        # main output: codon prediction
+        logits = self.proj(h)
+        
+        if return_features:
+            # biological feature predictions
+            gc_pred = torch.sigmoid(self.gc_predictor(h)).squeeze(-1)
+            structure_pred = self.structure_predictor(h).squeeze(-1)
+            
+            return logits, {
+                'gc_content': gc_pred,
+                'structure_energy': structure_pred,
+                'hidden_states': h
+            }
+        
+        return logits
