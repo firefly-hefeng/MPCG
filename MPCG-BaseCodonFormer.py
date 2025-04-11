@@ -449,3 +449,183 @@ class EnhancedCodonFormerE(nn.Module):
             }
         
         return logits
+
+
+# ==================== Multi-Objective Loss Function ====================
+class MultiObjectiveLoss(nn.Module):
+    """Multi-objective loss function"""
+    
+    def __init__(self, weights=None, device='cpu'):
+        super().__init__()
+        self.weights = weights or {
+            'ce': 1.0,
+            'cai': 0.3,
+            'rscu': 0.2,
+            'gc': 0.1,
+            'structure': 0.05,
+            'manufacturability': 0.05
+        }
+        self.device = device
+        self.feature_extractor = BiologicalFeatureExtractor()
+        
+    def forward(self, logits, targets, aa_seq, sp_id, aux_features=None, predictions=None):
+        """
+        Compute multi-objective loss
+        
+        Args:
+            logits: model predicted logits [B, L, V]
+            targets: true codon sequence [B, L]
+            aa_seq: amino acid sequence [B, L]
+            sp_id: species ID [B]
+            aux_features: auxiliary features [B, aux_dim]
+            predictions: additional predicted feature dictionary
+        """
+        losses = {}
+        
+        # 1. cross-entropy loss
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=0
+        )
+        losses['ce'] = ce_loss
+        
+        # 2. CAI loss
+        pred_codons = logits.argmax(dim=-1)
+        cai_loss = self._calculate_cai_loss(pred_codons, targets, sp_id)
+        losses['cai'] = cai_loss
+        
+        # 3. RSCU loss
+        rscu_loss = self._calculate_rscu_loss(pred_codons, targets)
+        losses['rscu'] = rscu_loss
+        
+        # 4. GC content loss
+        if predictions and 'gc_content' in predictions:
+            gc_loss = self._calculate_gc_loss(pred_codons, predictions['gc_content'])
+            losses['gc'] = gc_loss
+        else:
+            losses['gc'] = torch.tensor(0.0, device=self.device)
+        
+        # 5. structure loss
+        if predictions and 'structure_energy' in predictions:
+            structure_loss = self._calculate_structure_loss(predictions['structure_energy'])
+            losses['structure'] = structure_loss
+        else:
+            losses['structure'] = torch.tensor(0.0, device=self.device)
+        
+        # 6. manufacturability loss
+        manufact_loss = self._calculate_manufacturability_loss(pred_codons)
+        losses['manufacturability'] = manufact_loss
+        
+        # total loss
+        total_loss = sum(self.weights[k] * v for k, v in losses.items())
+        losses['total'] = total_loss
+        
+        return total_loss, losses
+    
+    def _calculate_cai_loss(self, pred_codons, target_codons, sp_id):
+        """CAI loss calculation"""
+        batch_size = pred_codons.size(0)
+        cai_losses = []
+        
+        for i in range(batch_size):
+            pred_seq = pred_codons[i][pred_codons[i] != 0]  # remove padding
+            target_seq = target_codons[i][target_codons[i] != 0]
+            
+            # simplified CAI calculation (in practice, species-specific weights should be used)
+            pred_cai = self._simple_cai(pred_seq)
+            target_cai = self._simple_cai(target_seq)
+            
+            cai_losses.append(F.mse_loss(pred_cai, target_cai))
+        
+        return torch.stack(cai_losses).mean()
+    
+    def _simple_cai(self, codon_ids):
+        """Simplified CAI calculation"""
+        # using a simplified version here; in practice, real CAI weights should be loaded per species
+        weights = torch.ones_like(codon_ids, dtype=torch.float) * 0.5
+        weights[codon_ids > 30] = 0.8  # assume high-ID codons are optimized
+        return weights.mean()
+    
+    def _calculate_rscu_loss(self, pred_codons, target_codons):
+        """RSCU divergence loss"""
+        # compute RSCU distribution difference between predicted and target sequences
+        pred_dist = self._get_codon_distribution(pred_codons)
+        target_dist = self._get_codon_distribution(target_codons)
+        
+        # KL divergence
+        kl_div = F.kl_div(
+            F.log_softmax(pred_dist, dim=-1),
+            F.softmax(target_dist, dim=-1),
+            reduction='batchmean'
+        )
+        return kl_div
+    
+    def _get_codon_distribution(self, codon_ids):
+        """Get codon distribution"""
+        batch_size, seq_len = codon_ids.shape
+        vocab_size = 61  # codon vocabulary size
+        
+        distributions = []
+        for i in range(batch_size):
+            valid_codons = codon_ids[i][codon_ids[i] != 0]
+            hist = torch.histc(valid_codons.float(), bins=vocab_size, min=1, max=vocab_size)
+            distributions.append(hist)
+        
+        return torch.stack(distributions)
+    
+    def _calculate_gc_loss(self, pred_codons, gc_pred):
+        """GC content loss"""
+        target_gc = 0.5  # target GC content
+        gc_loss = F.mse_loss(gc_pred.mean(dim=1), 
+                           torch.full((gc_pred.size(0),), target_gc, device=self.device))
+        return gc_loss
+    
+    def _calculate_structure_loss(self, structure_pred):
+        """RNA structure loss"""
+        # encourage lower folding energy (more stable structure)
+        target_energy = -10.0  # target folding energy
+        structure_loss = F.relu(structure_pred.mean(dim=1) - target_energy).mean()
+        return structure_loss
+    
+    def _calculate_manufacturability_loss(self, pred_codons):
+        """Manufacturability loss - avoid repeated sequences and extreme GC"""
+        batch_size = pred_codons.size(0)
+        manufact_losses = []
+        
+        for i in range(batch_size):
+            seq = pred_codons[i][pred_codons[i] != 0]
+            
+            # 1. repeat sequence penalty
+            repeat_penalty = self._calculate_repeat_penalty(seq)
+            
+            # 2. GC content variance penalty (overly localized GC distribution)
+            gc_var_penalty = self._calculate_gc_variance_penalty(seq)
+            
+            manufact_losses.append(repeat_penalty + gc_var_penalty)
+        
+        return torch.stack(manufact_losses).mean()
+    
+    def _calculate_repeat_penalty(self, sequence):
+        """Calculate repeat sequence penalty"""
+        if len(sequence) < 6:
+            return torch.tensor(0.0, device=self.device)
+        
+        # check triplet repeats
+        repeats = 0
+        for i in range(len(sequence) - 5):
+            if torch.equal(sequence[i:i+3], sequence[i+3:i+6]):
+                repeats += 1
+        
+        return torch.tensor(repeats / max(1, len(sequence) - 5), device=self.device)
+    
+    def _calculate_gc_variance_penalty(self, sequence):
+        """GC content variance penalty"""
+        if len(sequence) < 10:
+            return torch.tensor(0.0, device=self.device)
+        
+        # simplified GC variance calculation
+        # in practice, codon IDs need to be converted back to nucleotide sequences
+        gc_variance = torch.var(sequence.float()) / len(sequence)
+        return torch.relu(gc_variance - 1.0)  # penalize excessive variance
+
