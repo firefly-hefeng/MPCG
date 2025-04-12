@@ -629,3 +629,134 @@ class MultiObjectiveLoss(nn.Module):
         gc_variance = torch.var(sequence.float()) / len(sequence)
         return torch.relu(gc_variance - 1.0)  # penalize excessive variance
 
+
+# ==================== Enhanced Dataset ====================
+class EnhancedCodonDS(Dataset):
+    """Enhanced codon dataset"""
+    
+    def __init__(self, aa_sequences, nn_sequences, organisms, sp2id, 
+                 max_length=2000, augment=True):
+        self.data = []
+        self.feature_extractor = BiologicalFeatureExtractor()
+        self.max_length = max_length
+        self.augment = augment
+        
+        for aa_seq, nn_seq, organism in zip(aa_sequences, nn_sequences, organisms):
+            if len(aa_seq) <= max_length:
+                # basic data
+                aa_ids = aa_to_ids(aa_seq)
+                codons = [nn_seq[i:i+3] for i in range(0, len(nn_seq), 3)]
+                codon_ids = codon_to_ids(codons)
+                sp_id = sp2id.get(organism, 0)
+                
+                # biological feature extraction
+                aux_features = self._extract_biological_features(aa_seq, codons, organism)
+                
+                self.data.append({
+                    'aa_ids': aa_ids,
+                    'codon_ids': codon_ids,
+                    'sp_id': sp_id,
+                    'aux_features': aux_features,
+                    'raw_sequences': {'aa': aa_seq, 'codons': codons},
+                    'organism': organism
+                })
+    
+    def _extract_biological_features(self, aa_seq, codons, organism):
+        """Extract biological features"""
+        features = []
+        
+        # 1. sequence length (normalized)
+        features.append(len(aa_seq) / 1000.0)
+        
+        # 2. amino acid composition features (20-dim)
+        aa_counts = {aa: aa_seq.count(aa) / len(aa_seq) for aa in 'ARNDCQEGHILKMFPSTWYV'}
+        features.extend([aa_counts.get(aa, 0) for aa in 'ARNDCQEGHILKMFPSTWYV'])
+        
+        # 3. GC content
+        dna_seq = ''.join(codons)
+        gc_content = self.feature_extractor.calculate_gc_content(dna_seq)
+        features.append(gc_content)
+        
+        # 4. GC content variance
+        gc_variance = self.feature_extractor.calculate_gc_variance(dna_seq)
+        features.append(gc_variance)
+        
+        # 5. codon diversity (entropy)
+        codon_counts = {}
+        for codon in codons:
+            codon_counts[codon] = codon_counts.get(codon, 0) + 1
+        
+        if len(codon_counts) > 1:
+            probs = np.array(list(codon_counts.values())) / len(codons)
+            codon_entropy = entropy(probs)
+        else:
+            codon_entropy = 0.0
+        features.append(codon_entropy)
+        
+        # 6. rare codon proportion
+        rare_count = 0
+        for codon in codons:
+            if self._is_rare_codon(codon, organism):
+                rare_count += 1
+        features.append(rare_count / len(codons) if codons else 0.0)
+        
+        # total: 1 + 20 + 1 + 1 + 1 + 1 = 25 dimensions
+        return torch.tensor(features, dtype=torch.float32)
+    
+    def _is_rare_codon(self, codon, organism):
+        """Check if a codon is rare (simplified version)"""
+        # should be determined by species-specific codon frequency tables
+        # simplified version: assume certain codons are rare in all species
+        rare_codons = {'AGA', 'AGG', 'AUA', 'CUA', 'CCC', 'GGA'}
+        return codon in rare_codons
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # data augmentation
+        if self.augment and random.random() < 0.3:
+            item = self._augment_sequence(item)
+        
+        return (
+            item['aa_ids'],
+            item['codon_ids'],
+            item['sp_id'],
+            item['aux_features']
+        )
+    
+    def _augment_sequence(self, item):
+        """Sequence data augmentation"""
+        # deep copy to avoid modifying original data
+        import copy
+        new_item = copy.deepcopy(item)
+        
+        aa_ids = new_item['aa_ids']
+        codon_ids = new_item['codon_ids']
+        
+        # ensure aa_ids and codon_ids lengths match
+        # aa_ids contains <bos> and <eos>, so it is 2 longer than the actual amino acid sequence
+        # codon_ids contains only codons, without special tokens
+        
+        # random synonymous codon replacement (10% of positions)
+        # note: aa_ids[1:-1] corresponds to the actual amino acid sequence
+        # codon_ids[0:] corresponds to the codon sequence
+        
+        for i in range(len(codon_ids)):
+            if random.random() < 0.1:
+                # the corresponding index in aa_ids is i+1 (because of <bos>)
+                if i + 1 < len(aa_ids) - 1:  # ensure no out-of-bounds
+                    aa = ID2AA.get(aa_ids[i + 1])
+                    if aa and aa in SYN_CODON:
+                        synonymous_codons = SYN_CODON[aa]
+                        if len(synonymous_codons) > 1:
+                            current_codon = ID2CODON.get(codon_ids[i])
+                            available_codons = [c for c in synonymous_codons if c != current_codon]
+                            if available_codons:
+                                new_codon = random.choice(available_codons)
+                                if new_codon in CODON2ID:
+                                    codon_ids[i] = CODON2ID[new_codon]
+        
+        return new_item
