@@ -760,3 +760,223 @@ class EnhancedCodonDS(Dataset):
                                     codon_ids[i] = CODON2ID[new_codon]
         
         return new_item
+
+# ==================== Training Functions ====================
+def train_epoch(model, dataloader, optimizer, loss_fn, device, clip_grad=1.0):
+    """Train one epoch"""
+    model.train()
+    total_loss = 0
+    total_losses = {k: 0 for k in ['ce', 'cai', 'rscu', 'gc', 'structure', 'manufacturability']}
+    num_batches = 0
+    
+    for batch in dataloader:
+        aa, codon, sp, aux = [t.to(device) for t in batch]
+        
+        # forward pass
+        logits, predictions = model(aa, aa == 0, sp, aux, return_features=True)
+        
+        # apply synonymous mask
+        logits = synonym_mask(logits, aa)
+        
+        # compute loss
+        loss, loss_dict = loss_fn(
+            logits[:, 1:-1],  # remove <bos> and <eos>
+            codon,
+            aa,
+            sp,
+            aux,
+            predictions
+        )
+        
+        # backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # gradient clipping
+        if clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        
+        optimizer.step()
+        
+        # statistics
+        total_loss += loss.item()
+        for k, v in loss_dict.items():
+            if k in total_losses:
+                total_losses[k] += v.item()
+        num_batches += 1
+    
+    avg_losses = {k: v / num_batches for k, v in total_losses.items()}
+    avg_losses['total'] = total_loss / num_batches
+    
+    return avg_losses
+
+
+def enhanced_pad_batch(batch):
+    """Enhanced batch padding function"""
+    aa_ids, codon_ids, sp_ids, aux_features = zip(*batch)
+    
+    # pad sequences
+    aa_padded = pad_sequence([torch.tensor(seq) for seq in aa_ids], 
+                            batch_first=True, padding_value=0)
+    codon_padded = pad_sequence([torch.tensor(seq) for seq in codon_ids], 
+                               batch_first=True, padding_value=0)
+    
+    # convert to tensors
+    sp_tensor = torch.tensor(sp_ids)
+    aux_tensor = torch.stack(aux_features)
+    
+    return aa_padded, codon_padded, sp_tensor, aux_tensor
+
+
+# ==================== Main Training Function ====================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_file", required=True, help="Path to data file")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--model_dim", type=int, default=512, help="Model dimension")
+    parser.add_argument("--depth", type=int, default=8, help="Model depth")
+    parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--save_path", default="enhanced_codon_model.pt", help="Model save path")
+    args = parser.parse_args()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # load data
+    print("Loading data...")
+    import pandas as pd
+    df = pd.read_csv(args.data_file)
+    
+    # build organism mapping
+    organisms = df['Organism'].unique()
+    sp2id = {org: i+1 for i, org in enumerate(organisms)}  # reserve 0 for padding
+    sp2id['<pad>'] = 0
+    
+    # create dataset
+    dataset = EnhancedCodonDS(
+        df['RefSeq_aa'].tolist(),
+        df['RefSeq_nn'].tolist(),
+        df['Organism'].tolist(),
+        sp2id
+    )
+    
+    # split into training and validation sets
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    # create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=enhanced_pad_batch,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=enhanced_pad_batch,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # create model
+    print("Creating model...")
+    model = EnhancedCodonFormerE(
+        v_aa=len(AA_TOKENS),
+        v_cd=len(CODON_TOKENS),
+        v_sp=len(sp2id),
+        aux_dim=25,  # adjusted according to feature extraction dimensions
+        d=args.model_dim,
+        depth=args.depth,
+        heads=args.heads
+    ).to(device)
+    
+    # create loss function
+    loss_fn = MultiObjectiveLoss(device=device)
+    
+    # create optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.01,
+        betas=(0.9, 0.98)
+    )
+    
+    # learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
+    )
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # training loop
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+    
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print("-" * 50)
+        
+        # training
+        train_losses = train_epoch(model, train_loader, optimizer, loss_fn, device)
+        
+        # validation
+        model.eval()
+        val_loss = 0
+        num_val_batches = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                aa, codon, sp, aux = [t.to(device) for t in batch]
+                logits, predictions = model(aa, aa == 0, sp, aux, return_features=True)
+                logits = synonym_mask(logits, aa)
+                
+                loss, _ = loss_fn(logits[:, 1:-1], codon, aa, sp, aux, predictions)
+                val_loss += loss.item()
+                num_val_batches += 1
+        
+        val_loss /= num_val_batches
+        
+        # print results
+        print(f"Train - Total: {train_losses['total']:.4f}, CE: {train_losses['ce']:.4f}, "
+              f"CAI: {train_losses['cai']:.4f}, RSCU: {train_losses['rscu']:.4f}")
+        print(f"Valid - Loss: {val_loss:.4f}")
+        
+        # learning rate scheduling
+        scheduler.step()
+        print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'sp2id': sp2id,
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'train_losses': train_losses
+            }, args.save_path)
+            print(f"New best model saved! Val loss: {val_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping after {patience} epochs without improvement")
+                break
+    
+    print("\nTraining completed!")
+
+
+if __name__ == "__main__":
+    main()
