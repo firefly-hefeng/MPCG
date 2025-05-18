@@ -248,3 +248,108 @@ class FiveSpeciesCodonData:
             'GGT': 0.45, 'GGC': 0.21, 'GGA': 0.23, 'GGG': 0.11,
             'TAA': 0.45, 'TAG': 0.25, 'TGA': 0.30,
         }
+    
+    def _initialize_trna_abundances(self):
+        """Initialize tRNA abundance data (based on tRNA gene copy number and expression data)."""
+        
+        self.trna_abundances = {}
+        
+        # 1. Human tRNA abundance
+        self.trna_abundances['Homo sapiens'] = {
+            'TTT': 0.8, 'TTC': 1.2, 'TTA': 0.3, 'TTG': 0.6,
+            'CTT': 0.5, 'CTC': 0.9, 'CTA': 0.3, 'CTG': 1.4,
+            'ATT': 0.9, 'ATC': 1.3, 'ATA': 0.5, 'ATG': 1.6,
+            'GTT': 0.6, 'GTC': 0.8, 'GTA': 0.4, 'GTG': 1.3,
+            'TCT': 0.7, 'TCC': 0.9, 'TCA': 0.6, 'TCG': 0.3, 'AGT': 0.6, 'AGC': 0.9,
+            'CCT': 0.8, 'CCC': 1.0, 'CCA': 0.7, 'CCG': 0.4,
+            'ACT': 0.7, 'ACC': 1.1, 'ACA': 0.8, 'ACG': 0.4,
+            'GCT': 0.8, 'GCC': 1.2, 'GCA': 0.7, 'GCG': 0.4,
+            'TAT': 0.9, 'TAC': 1.1, 'CAT': 0.8, 'CAC': 1.1,
+            'CAA': 0.6, 'CAG': 1.3, 'AAT': 0.9, 'AAC': 1.1,
+            'AAA': 0.9, 'AAG': 1.2, 'GAT': 0.9, 'GAC': 1.1,
+            'GAA': 0.9, 'GAG': 1.2, 'TGT': 0.8, 'TGC': 1.1,
+            'TGG': 1.0, 'CGT': 0.4, 'CGC': 0.7, 'CGA': 0.4,
+            'CGG': 0.6, 'AGA': 0.7, 'AGG': 0.6, 'GGT': 0.6,
+            'GGC': 1.1, 'GGA': 0.8, 'GGG': 0.7,
+            'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
+        }
+        
+        # 2. Mouse tRNA abundance
+        self.trna_abundances['Mus musculus'] = {
+            'TTT': 0.8, 'TTC': 1.3, 'TTA': 0.3, 'TTG': 0.5,
+            'CTT': 0.5, 'CTC': 0.9, 'CTA': 0.3, 'CTG': 1.5,
+            'ATT': 0.8, 'ATC': 1.4, 'ATA': 0.5, 'ATG': 1.7,
+            'GTT': 0.6, 'GTC': 0.8, 'GTA': 0.4, 'GTG': 1.4,
+            'TCT': 0.7, 'TCC': 1.0, 'TCA': 0.6, 'TCG': 0.3, 'AGT': 0.6, 'AGC': 1.0,
+            'CCT': 0.8, 'CCC': 1.1, 'CCA': 0.7, 'CCG': 0.4,
+            'ACT': 0.7, 'ACC': 1.2, 'ACA': 0.8, 'ACG': 0.4,
+            'GCT': 0.8, 'GCC': 1.3, 'GCA': 0.7, 'GCG': 0.4,
+            'TAT': 0.9, 'TAC': 1.2, 'CAT': 0.8, 'CAC': 1.2,
+            'CAA': 0.6, 'CAG': 1.4, 'AAT': 0.9, 'AAC': 1.2,
+            'AAA': 0.8, 'AAG': 1.3, 'GAT': 0.9, 'GAC': 1.2,
+            'GAA': 0.8, 'GAG': 1.3, 'TGT': 0.8, 'TGC': 1.2,
+            'TGG': 1.0, 'CGT': 0.4, 'CGC': 0.8, 'CGA': 0.4,
+            'CGG': 0.7, 'AGA': 0.7, 'AGG': 0.6, 'GGT': 0.6,
+            'GGC': 1.2, 'GGA': 0.8, 'GGG': 0.7,
+            'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
+        }
+        
+        # 3. E. coli tRNA abundance
+        self.trna_abundances['Escherichia coli'] = {
+            'TTT': 1.0, 'TTC': 1.2, 'TTA': 0.3, 'TTG': 0.8,
+            'CTT': 0.6, 'CTC': 0.5, 'CTA': 0.2, 'CTG': 1.5,
+            'ATT': 1.3, 'ATC': 1.1, 'ATA': 0.4, 'ATG': 1.8,
+            'GTT': 0.9, 'GTC': 0.7, 'GTA': 0.5, 'GTG': 1.2,
+            'TCT': 0.8, 'TCC': 0.7, 'TCA': 0.6, 'TCG': 0.5, 'AGT': 0.7, 'AGC': 0.9,
+            'CCT': 0.7, 'CCC': 0.5, 'CCA': 0.8, 'CCG': 1.3,
+            'ACT': 0.8, 'ACC': 1.2, 'ACA': 0.7, 'ACG': 0.9,
+            'GCT': 0.9, 'GCC': 1.1, 'GCA': 0.8, 'GCG': 1.0,
+            'TAT': 1.1, 'TAC': 0.9, 'CAT': 1.0, 'CAC': 0.8,
+            'CAA': 0.7, 'CAG': 1.3, 'AAT': 1.0, 'AAC': 0.9,
+            'AAA': 1.4, 'AAG': 0.8, 'GAT': 1.2, 'GAC': 0.9,
+            'GAA': 1.3, 'GAG': 0.9, 'TGT': 0.8, 'TGC': 0.9,
+            'TGG': 1.0, 'CGT': 1.1, 'CGC': 1.0, 'CGA': 0.3,
+            'CGG': 0.4, 'AGA': 0.3, 'AGG': 0.2, 'GGT': 1.1,
+            'GGC': 1.2, 'GGA': 0.6, 'GGG': 0.7,
+            'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
+        }
+        
+        # 4. S. cerevisiae tRNA abundance
+        self.trna_abundances['Saccharomyces cerevisiae'] = {
+            'TTT': 1.2, 'TTC': 0.9, 'TTA': 0.8, 'TTG': 0.9,
+            'CTT': 0.6, 'CTC': 0.3, 'CTA': 0.5, 'CTG': 0.5,
+            'ATT': 1.1, 'ATC': 0.7, 'ATA': 0.7, 'ATG': 1.5,
+            'GTT': 1.1, 'GTC': 0.7, 'GTA': 0.6, 'GTG': 0.6,
+            'TCT': 0.9, 'TCC': 0.6, 'TCA': 0.7, 'TCG': 0.4, 'AGT': 0.6, 'AGC': 0.5,
+            'CCT': 0.9, 'CCC': 0.5, 'CCA': 1.1, 'CCG': 0.4,
+            'ACT': 1.0, 'ACC': 0.7, 'ACA': 0.8, 'ACG': 0.5,
+            'GCT': 1.0, 'GCC': 0.7, 'GCA': 0.8, 'GCG': 0.4,
+            'TAT': 1.1, 'TAC': 0.8, 'CAT': 1.2, 'CAC': 0.7,
+            'CAA': 1.2, 'CAG': 0.6, 'AAT': 1.1, 'AAC': 0.8,
+            'AAA': 1.1, 'AAG': 0.8, 'GAT': 1.2, 'GAC': 0.7,
+            'GAA': 1.3, 'GAG': 0.7, 'TGT': 1.1, 'TGC': 0.7,
+            'TGG': 1.0, 'CGT': 0.6, 'CGC': 0.3, 'CGA': 0.3,
+            'CGG': 0.2, 'AGA': 1.1, 'AGG': 0.6, 'GGT': 1.2,
+            'GGC': 0.7, 'GGA': 0.7, 'GGG': 0.5,
+            'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
+        }
+        
+        # 5. Pichia angusta tRNA abundance
+        self.trna_abundances['Pichia angusta'] = {
+            'TTT': 1.1, 'TTC': 0.9, 'TTA': 0.7, 'TTG': 0.9,
+            'CTT': 0.7, 'CTC': 0.4, 'CTA': 0.5, 'CTG': 0.5,
+            'ATT': 1.0, 'ATC': 0.7, 'ATA': 0.7, 'ATG': 1.5,
+            'GTT': 1.0, 'GTC': 0.7, 'GTA': 0.6, 'GTG': 0.7,
+            'TCT': 0.9, 'TCC': 0.7, 'TCA': 0.7, 'TCG': 0.4, 'AGT': 0.6, 'AGC': 0.5,
+            'CCT': 0.9, 'CCC': 0.6, 'CCA': 1.0, 'CCG': 0.4,
+            'ACT': 1.0, 'ACC': 0.8, 'ACA': 0.8, 'ACG': 0.5,
+            'GCT': 1.1, 'GCC': 0.8, 'GCA': 0.8, 'GCG': 0.4,
+            'TAT': 1.1, 'TAC': 0.9, 'CAT': 1.1, 'CAC': 0.8,
+            'CAA': 1.1, 'CAG': 0.7, 'AAT': 1.0, 'AAC': 0.9,
+            'AAA': 1.1, 'AAG': 0.8, 'GAT': 1.1, 'GAC': 0.8,
+            'GAA': 1.2, 'GAG': 0.8, 'TGT': 1.0, 'TGC': 0.8,
+            'TGG': 1.0, 'CGT': 0.7, 'CGC': 0.4, 'CGA': 0.4,
+            'CGG': 0.3, 'AGA': 1.0, 'AGG': 0.6, 'GGT': 1.1,
+            'GGC': 0.8, 'GGA': 0.7, 'GGG': 0.5,
+            'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
+        }
