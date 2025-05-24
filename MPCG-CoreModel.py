@@ -353,3 +353,78 @@ class FiveSpeciesCodonData:
             'GGC': 0.8, 'GGA': 0.7, 'GGG': 0.5,
             'TAA': 0.0, 'TAG': 0.0, 'TGA': 0.0,
         }
+    
+    def _calculate_rscu(self, codon_freq: Dict[str, float]) -> Dict[str, float]:
+        """Calculate RSCU values."""
+        rscu = {}
+        
+        # Group by amino acid
+        aa_codons = defaultdict(list)
+        for codon, freq in codon_freq.items():
+            if codon in self.genetic_code.forward_table:
+                aa = self.genetic_code.forward_table[codon]
+            elif codon in self.genetic_code.stop_codons:
+                aa = '*'
+            else:
+                continue
+            aa_codons[aa].append((codon, freq))
+        
+        # Calculate RSCU
+        for aa, codon_list in aa_codons.items():
+            n_synonymous = len(codon_list)
+            total_freq = sum(freq for _, freq in codon_list)
+            
+            for codon, freq in codon_list:
+                if total_freq > 0:
+                    rscu[codon] = (freq * n_synonymous) / total_freq
+                else:
+                    rscu[codon] = 1.0
+        
+        return rscu
+    
+    def _calculate_cai_weights(self, codon_freq: Dict[str, float]) -> Dict[str, float]:
+        """Calculate CAI weights."""
+        weights = {}
+        
+        # Group by amino acid
+        aa_codons = defaultdict(list)
+        for codon, freq in codon_freq.items():
+            if codon in self.genetic_code.forward_table:
+                aa = self.genetic_code.forward_table[codon]
+            elif codon in self.genetic_code.stop_codons:
+                aa = '*'
+            else:
+                continue
+            aa_codons[aa].append((codon, freq))
+        
+        # Calculate weights
+        for aa, codon_list in aa_codons.items():
+            max_freq = max(freq for _, freq in codon_list)
+            
+            for codon, freq in codon_list:
+                if max_freq > 0:
+                    weights[codon] = freq / max_freq
+                else:
+                    weights[codon] = 1.0
+        
+        return weights
+    
+    def get_species_index(self, species_name: str) -> int:
+        """Get species index."""
+        try:
+            return self.species_list.index(species_name)
+        except ValueError:
+            return 0
+    
+    def get_codon_freq(self, species: str) -> Dict[str, float]:
+        return self.codon_frequencies.get(species, {})
+    
+    def get_rscu(self, species: str) -> Dict[str, float]:
+        return self.species_rscu.get(species, {})
+    
+    def get_cai_weights(self, species: str) -> Dict[str, float]:
+        return self.species_cai_weights.get(species, {})
+    
+    def get_trna_abundance(self, species: str) -> Dict[str, float]:
+        return self.trna_abundances.get(species, {})
+
