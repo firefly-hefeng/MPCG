@@ -428,3 +428,69 @@ class FiveSpeciesCodonData:
     def get_trna_abundance(self, species: str) -> Dict[str, float]:
         return self.trna_abundances.get(species, {})
 
+
+# ==================== Neural RNA Folder ====================
+class NeuralRNAFolder(nn.Module):
+    """Neural network RNA folding predictor."""
+    
+    def __init__(self, d_model: int = 512, n_layers: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Nucleotide embedding (0=pad, 1=A, 2=C, 3=G, 4=U/T)
+        self.nucleotide_embed = nn.Embedding(5, d_model, padding_idx=0)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=8,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # MFE prediction head
+        self.mfe_head = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 1)
+        )
+        
+        # Structure prediction head
+        self.struct_head = nn.Linear(d_model, d_model)
+    
+    def forward(self, nucleotide_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            nucleotide_seq: [B, L] nucleotide sequence
+        Returns:
+            mfe: [B] minimum folding energy
+            pairing_matrix: [B, L, L] pairing probability matrix
+        """
+        # Embedding
+        x = self.nucleotide_embed(nucleotide_seq)  # [B, L, D]
+        
+        # Padding mask
+        mask = (nucleotide_seq == 0)
+        
+        
+
+        # Transformer encoding
+        x = self.transformer(x, src_key_padding_mask=mask)
+        
+        # MFE prediction
+        mfe = self.mfe_head(x.mean(dim=1)).squeeze(-1)  # [B]
+        
+        # Pairing probability matrix
+        struct_repr = self.struct_head(x)  # [B, L, D]
+        pairing_matrix = torch.matmul(struct_repr, struct_repr.transpose(1, 2))
+        pairing_matrix = torch.sigmoid(pairing_matrix)
+        
+        # Symmetrization
+        pairing_matrix = (pairing_matrix + pairing_matrix.transpose(1, 2)) / 2
+        
+        return mfe, pairing_matrix
+
