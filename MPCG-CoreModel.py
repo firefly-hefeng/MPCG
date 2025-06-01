@@ -494,3 +494,71 @@ class NeuralRNAFolder(nn.Module):
         
         return mfe, pairing_matrix
 
+
+# ==================== Translation Dynamics Model ====================
+class TranslationDynamicsModel(nn.Module):
+    """Translation dynamics model."""
+    
+    def __init__(self, d_model: int, trna_vocab_size: int = 65):
+        super().__init__()
+        
+        # tRNA abundance embedding
+        self.trna_embed = nn.Embedding(trna_vocab_size, d_model // 2)
+        
+        # Pause probability predictor
+        self.pause_predictor = nn.Sequential(
+            nn.Linear(d_model + d_model // 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+        
+        # Elongation rate predictor
+        self.elongation_predictor = nn.Sequential(
+            nn.Linear(d_model + d_model // 2, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Softplus()
+        )
+    
+    def forward(
+        self,
+        codon_embed: torch.Tensor,
+        trna_ids: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            codon_embed: [B, L, D]
+            trna_ids: [B, L]
+        Returns:
+            dict with pause_prob, translation_time, cumulative_time
+        """
+        # tRNA features
+        trna_features = self.trna_embed(trna_ids)  # [B, L, D/2]
+        
+        # Combined features
+        combined = torch.cat([codon_embed, trna_features], dim=-1)
+        
+        # Pause probability
+        pause_prob = self.pause_predictor(combined).squeeze(-1)  # [B, L]
+        
+        # Elongation rate
+        elongation_rate = self.elongation_predictor(combined).squeeze(-1)  # [B, L]
+        
+        # Translation time
+        translation_time = 1.0 / (elongation_rate + 1e-6)
+        translation_time = translation_time * (1 + pause_prob * 10)
+        
+        # Cumulative time
+        cumulative_time = torch.cumsum(translation_time, dim=1)
+        
+        return {
+            'pause_prob': pause_prob,
+            'elongation_rate': elongation_rate,
+            'translation_time': translation_time,
+            'cumulative_time': cumulative_time
+        }
+
