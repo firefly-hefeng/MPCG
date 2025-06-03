@@ -562,3 +562,65 @@ class TranslationDynamicsModel(nn.Module):
             'cumulative_time': cumulative_time
         }
 
+
+# ==================== Kinetic Positional Encoding ====================
+class PositionalEncoding(nn.Module):
+    """Kinetic positional encoding based on translation time."""
+    
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(p=dropout)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        
+        # Standard positional encoding
+        pe_standard = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        
+        pe_standard[:, 0::2] = torch.sin(position * div_term)
+        pe_standard[:, 1::2] = torch.cos(position * div_term)
+        
+        self.register_buffer('pe_standard', pe_standard)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        translation_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, L, D]
+            translation_times: [B, L]
+        """
+        B, L, D = x.shape
+        
+        # Standard encoding
+        pe_std = self.pe_standard[:L].unsqueeze(0).expand(B, -1, -1)
+        
+        if translation_times is None:
+            return self.dropout(x + pe_std)
+        
+        # Dynamic encoding
+        cum_times = torch.cumsum(translation_times, dim=1)
+        max_time = cum_times[:, -1:] + 1e-6
+        normalized_times = cum_times / max_time
+        
+        pe_dynamic = torch.zeros(B, L, D, device=x.device, dtype=x.dtype)
+        div_term = torch.exp(
+            torch.arange(0, D, 2, device=x.device, dtype=x.dtype) *
+            (-math.log(10000.0) / D)
+        )
+        
+        times_expanded = normalized_times.unsqueeze(-1)
+        pe_dynamic[:, :, 0::2] = torch.sin(times_expanded * div_term)
+        pe_dynamic[:, :, 1::2] = torch.cos(times_expanded * div_term)
+        
+        # Mix
+        alpha = torch.sigmoid(self.alpha)
+        pe_mixed = alpha * pe_std + (1 - alpha) * pe_dynamic
+        
+        return self.dropout(x + pe_mixed)
+
