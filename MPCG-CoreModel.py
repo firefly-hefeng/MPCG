@@ -624,3 +624,132 @@ class PositionalEncoding(nn.Module):
         
         return self.dropout(x + pe_mixed)
 
+
+# ==================== Physics-Constrained Attention ====================
+class PhysicsConstrainedAttention(nn.Module):
+    """Physics-constrained multi-head attention."""
+    
+    def __init__(self, config):  # ✅ Add config parameter
+        """
+        Initialize physics-constrained attention layer.
+        
+        Args:
+            config: Model configuration object.
+        """
+        super().__init__()
+        
+        # Get parameters from config
+        self.d_model = config.d_model
+        self.n_heads = config.n_heads
+        self.dropout_rate = config.dropout
+        
+        # Ensure d_model is divisible by n_heads
+        assert self.d_model % self.n_heads == 0, \
+            f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+        
+        self.d_k = self.d_model // self.n_heads
+        
+        # Q, K, V projections
+        self.q_proj = nn.Linear(self.d_model, self.d_model)
+        self.k_proj = nn.Linear(self.d_model, self.d_model)
+        self.v_proj = nn.Linear(self.d_model, self.d_model)
+        
+        # Output projection
+        self.out_proj = nn.Linear(self.d_model, self.d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(self.dropout_rate)
+        
+        # ✅ Physics constraint related layers
+        # RNA secondary structure constraint
+        self.pairing_layer = nn.Linear(1, self.n_heads)
+        
+        # Ribosomal pause constraint
+        self.pause_layer = nn.Linear(1, self.n_heads)
+        
+        # Layer normalization (optional)
+        self.layer_norm = nn.LayerNorm(self.d_model)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        pairing_matrix: Optional[torch.Tensor] = None,
+        pause_prob: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor [B, L, D]
+            mask: Attention mask [B, L], True indicates positions to be masked
+            pairing_matrix: RNA pairing matrix [B, L, L]
+            pause_prob: Ribosomal pause probability [B, L]
+        
+        Returns:
+            output: Output tensor [B, L, D]
+            attn_weights: Attention weights [B, n_heads, L, L]
+        """
+        B, L, D = x.shape
+        
+        # Linear projections
+        q = self.q_proj(x).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, L, d_k]
+        k = self.k_proj(x).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, L, d_k]
+        v = self.v_proj(x).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, L, d_k]
+        
+        # Attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [B, n_heads, L, L]
+        
+        # ✅ Mask with dtype-safe value
+        if mask is not None:
+            # Ensure mask length matches
+            L_k = scores.size(-1)
+            L_mask = mask.size(1)
+            
+            if L_mask != L_k:
+                if L_mask < L_k:
+                    pad_len = L_k - L_mask
+                    mask = torch.cat([
+                        mask,
+                        torch.zeros(mask.size(0), pad_len, dtype=mask.dtype, device=mask.device)
+                    ], dim=1)
+                else:
+                    mask = mask[:, :L_k]
+            
+            mask_expanded = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+            
+            # ✅ Use safe mask value
+            mask_value = get_mask_value(scores.dtype)
+            scores = scores.masked_fill(mask_expanded, mask_value)
+        
+        # ✅ Physics constraints
+        if pairing_matrix is not None:
+            # RNA secondary structure constraint
+            # pairing_matrix: [B, L, L] or [B, L, L, 1]
+            if pairing_matrix.dim() == 3:
+                pairing_matrix = pairing_matrix.unsqueeze(-1)  # [B, L, L, 1]
+            
+            pairing_bias = self.pairing_layer(pairing_matrix)  # [B, L, L, n_heads]
+            pairing_bias = pairing_bias.permute(0, 3, 1, 2)  # [B, n_heads, L, L]
+            scores = scores + pairing_bias
+        
+        if pause_prob is not None:
+            # Ribosomal pause constraint
+            # pause_prob: [B, L]
+            pause_bias = self.pause_layer(pause_prob.unsqueeze(-1))  # [B, L, n_heads]
+            pause_bias = pause_bias.transpose(1, 2).unsqueeze(-1)  # [B, n_heads, L, 1]
+            scores = scores + pause_bias
+        
+        # Softmax
+        attn_weights = F.softmax(scores, dim=-1)  # [B, n_heads, L, L]
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention
+        attn_out = torch.matmul(attn_weights, v)  # [B, n_heads, L, d_k]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)  # [B, L, D]
+        
+        # Output projection
+        output = self.out_proj(attn_out)
+        
+        return output, attn_weights
+
