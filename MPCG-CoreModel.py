@@ -753,3 +753,49 @@ class PhysicsConstrainedAttention(nn.Module):
         
         return output, attn_weights
 
+# ==================== Transformer Layer ====================
+class MPCGTransformerLayer(nn.Module):
+    """MPCG Transformer layer."""
+    
+    def __init__(self, config: MPCGConfig):
+        super().__init__()
+        
+        self.attn = PhysicsConstrainedAttention(config)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_ff, config.d_model),
+            nn.Dropout(config.dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.norm2 = nn.LayerNorm(config.d_model)
+        
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        pairing_matrix: Optional[torch.Tensor] = None,
+        pause_prob: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, L, D]
+        """
+        # Attention sub-layer (Pre-LN)
+        normed_x = self.norm1(x)
+        attn_out, attn_weights = self.attn(
+            normed_x, mask, pairing_matrix, pause_prob
+        )
+        x = x + self.dropout(attn_out)
+        
+        # Feed-forward sub-layer
+        normed_x = self.norm2(x)
+        ff_out = self.feed_forward(normed_x)
+        x = x + self.dropout(ff_out)
+        
+        return x, attn_weights
