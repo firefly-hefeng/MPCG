@@ -799,3 +799,171 @@ class MPCGTransformerLayer(nn.Module):
         x = x + self.dropout(ff_out)
         
         return x, attn_weights
+
+
+# ==================== Full Model ====================
+class MPCGCodon(nn.Module):
+    """MPCG-Codon model."""
+    
+    def __init__(
+        self,
+        config=None,
+        vocab_size: int = 128,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_len: int = 2048,
+        num_species: int = 6,
+        aux_dim: int = 64,
+        v_aa: int = None,  # Add amino acid vocabulary size
+        v_codon: int = None,  # Add codon vocabulary size
+        **kwargs  # Accept other possible parameters
+    ):
+        super().__init__()
+        
+        # If config is provided, use parameters from config
+        if config is not None:
+            if isinstance(config, dict):
+                vocab_size = config.get('vocab_size', vocab_size)
+                d_model = config.get('d_model', d_model)
+                nhead = config.get('nhead', nhead)
+                num_layers = config.get('num_layers', num_layers)
+                dim_feedforward = config.get('dim_feedforward', dim_feedforward)
+                dropout = config.get('dropout', dropout)
+                max_len = config.get('max_len', max_len)
+                num_species = config.get('num_species', num_species)
+                aux_dim = config.get('aux_dim', aux_dim)
+                v_aa = config.get('v_aa', v_aa)
+                v_codon = config.get('v_codon', v_codon)
+            else:
+                # config is an object
+                vocab_size = getattr(config, 'vocab_size', vocab_size)
+                d_model = getattr(config, 'd_model', d_model)
+                nhead = getattr(config, 'nhead', nhead)
+                num_layers = getattr(config, 'num_layers', num_layers)
+                dim_feedforward = getattr(config, 'dim_feedforward', dim_feedforward)
+                dropout = getattr(config, 'dropout', dropout)
+                max_len = getattr(config, 'max_len', max_len)
+                num_species = getattr(config, 'num_species', num_species)
+                aux_dim = getattr(config, 'aux_dim', aux_dim)
+                v_aa = getattr(config, 'v_aa', v_aa)
+                v_codon = getattr(config, 'v_codon', v_codon)
+        
+        # If v_aa and v_codon are specified, use them
+        # Otherwise use vocab_size
+        aa_vocab_size = v_aa if v_aa is not None else vocab_size
+        codon_vocab_size = v_codon if v_codon is not None else vocab_size
+        
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.aa_vocab_size = aa_vocab_size
+        self.codon_vocab_size = codon_vocab_size
+        
+        # Embeddings
+        self.aa_embed = nn.Embedding(aa_vocab_size, d_model, padding_idx=0)
+        self.codon_embed = nn.Embedding(codon_vocab_size, d_model, padding_idx=0)
+        self.species_embed = nn.Embedding(num_species, d_model)
+        
+        # Position encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len)
+        
+        # Auxiliary features
+        self.aux_fc = nn.Linear(aux_dim, d_model)
+        
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            MPCGTransformerLayer(config)  # ✅ Use physics-constrained Transformer layer
+            for _ in range(num_layers)
+        ])
+        
+        # Output projection - outputs codon probability distribution
+        self.output_proj = nn.Linear(d_model, codon_vocab_size)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def forward(
+        self,
+        aa_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        species_ids: Optional[torch.Tensor] = None,
+        aux_features: Optional[torch.Tensor] = None,
+        nucleotide_seq: Optional[torch.Tensor] = None,
+        trna_ids: Optional[torch.Tensor] = None,
+        codon_ids: Optional[torch.Tensor] = None,
+        return_features: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
+        """Forward pass."""
+        B, L = aa_ids.shape
+        
+        # Add BOS and EOS tokens
+        bos_token = torch.full((B, 1), 1, dtype=torch.long, device=aa_ids.device)
+        eos_token = torch.full((B, 1), 2, dtype=torch.long, device=aa_ids.device)
+        aa_ids_with_special = torch.cat([bos_token, aa_ids, eos_token], dim=1)
+        
+        # Process codon sequence
+        if codon_ids is not None:
+            # Ensure length matches
+            if codon_ids.shape[1] != aa_ids.shape[1]:
+                if codon_ids.shape[1] > aa_ids.shape[1]:
+                    codon_ids = codon_ids[:, :aa_ids.shape[1]]
+                else:
+                    pad_len = aa_ids.shape[1] - codon_ids.shape[1]
+                    codon_ids = torch.cat([
+                        codon_ids,
+                        torch.zeros(B, pad_len, dtype=torch.long, device=codon_ids.device)
+                    ], dim=1)
+            
+            codon_bos = torch.full((B, 1), 1, dtype=torch.long, device=codon_ids.device)
+            codon_eos = torch.full((B, 1), 2, dtype=torch.long, device=codon_ids.device)
+            codon_ids_with_special = torch.cat([codon_bos, codon_ids, codon_eos], dim=1)
+        else:
+            codon_ids_with_special = torch.zeros_like(aa_ids_with_special)
+        
+        # Ensure sequence lengths are consistent
+        assert aa_ids_with_special.shape == codon_ids_with_special.shape, \
+            f"Shape mismatch: aa={aa_ids_with_special.shape}, codon={codon_ids_with_special.shape}"
+        
+        # ✅ Generate mask for sequence with special tokens added
+        # Note: <bos> and <eos> are never padding (values are 1 and 2, not 0)
+        mask_with_special = (aa_ids_with_special == 0)  # [B, L+2]
+        
+        # Embedding
+        x = self.aa_embed(aa_ids_with_special) + self.codon_embed(codon_ids_with_special)
+        
+        # Position encoding
+        x = self.pos_encoder(x)
+        
+        # Species embedding
+        if species_ids is not None:
+            sp_emb = self.species_embed(species_ids).unsqueeze(1)
+            x = x + sp_emb
+        
+        # Auxiliary features
+        if aux_features is not None:
+            aux_emb = self.aux_fc(aux_features).unsqueeze(1)
+            x = x + aux_emb
+        
+        # Transformer layers
+        features_dict = {}
+        
+        for i, layer in enumerate(self.layers):
+            x, attn_weights = layer(x, mask_with_special)  # ✅ Use mask with correct length
+            if return_features:
+                features_dict[f'layer_{i}_attn'] = attn_weights
+        
+        # Output projection
+        logits = self.output_proj(x)
+        
+        if return_features:
+            features_dict['final_hidden'] = x
+            return logits, features_dict
+        
+        return logits
