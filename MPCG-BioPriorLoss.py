@@ -92,3 +92,131 @@ class CAICalculator(nn.Module):
         
         return cai
 
+
+# ==================== RSCU Calculator ====================
+class RSCUCalculator(nn.Module):
+    """RSCU Calculator"""
+    
+    def __init__(self, codon_data: FiveSpeciesCodonData, device: str = 'cpu'):
+        super().__init__()
+        self.codon_data = codon_data
+        self.device = device
+        
+        # Precompute reference distributions
+        self._precompute_reference_distributions()
+    
+    def _precompute_reference_distributions(self):
+        """Precompute reference RSCU distributions"""
+        from MPCG_BaseCodonFormer import CODON2ID
+        
+        n_codons = len(CODON2ID)
+        n_species = len(self.codon_data.species_list)
+        
+        ref_distributions = torch.zeros(n_species, n_codons)
+        
+        for sp_idx, species in enumerate(self.codon_data.species_list):
+            rscu_dict = self.codon_data.get_rscu(species)
+            
+            for codon, rscu_value in rscu_dict.items():
+                if codon in CODON2ID:
+                    codon_idx = CODON2ID[codon]
+                    ref_distributions[sp_idx, codon_idx] = rscu_value
+        
+        self.register_buffer('ref_distributions', ref_distributions)
+        self.species_list = self.codon_data.species_list
+    
+    def compute_sequence_rscu(
+        self,
+        codon_ids: torch.Tensor,
+        aa_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute sequence RSCU distribution"""
+        from MPCG_BaseCodonFormer import ID2AA, CODON2ID, SYN_CODON
+        
+        B, L = codon_ids.shape
+        n_codons = len(CODON2ID)
+        
+        rscu_dist = torch.zeros(B, n_codons, device=codon_ids.device)
+        
+        for b in range(B):
+            codon_counts = torch.zeros(n_codons, device=codon_ids.device)
+            
+            if mask is not None:
+                valid_positions = mask[b].nonzero(as_tuple=True)[0]
+            else:
+                valid_positions = torch.arange(L, device=codon_ids.device)
+            
+            for pos in valid_positions:
+                codon_idx = codon_ids[b, pos].item()
+                if codon_idx > 0:
+                    codon_counts[codon_idx] += 1
+            
+            # Group by amino acid
+            aa_codon_counts = defaultdict(lambda: defaultdict(int))
+            
+            for pos in valid_positions:
+                aa_idx = aa_ids[b, pos].item()
+                codon_idx = codon_ids[b, pos].item()
+                
+                if aa_idx <= 2 or codon_idx == 0:
+                    continue
+                
+                aa = ID2AA.get(aa_idx)
+                if aa:
+                    aa_codon_counts[aa][codon_idx] = codon_counts[codon_idx].item()
+            
+            # Compute RSCU
+            for aa, codons_dict in aa_codon_counts.items():
+                if aa not in SYN_CODON:
+                    continue
+                
+                synonymous_codons = SYN_CODON[aa]
+                n_synonymous = len(synonymous_codons)
+                
+                total_count = sum(codons_dict.values())
+                
+                if total_count > 0:
+                    for codon_idx, count in codons_dict.items():
+                        rscu_value = (count * n_synonymous) / total_count
+                        rscu_dist[b, codon_idx] = rscu_value
+        
+        return rscu_dist
+    
+    def forward(
+        self,
+        pred_codon_ids: torch.Tensor,
+        target_codon_ids: torch.Tensor,
+        aa_ids: torch.Tensor,
+        species_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute RSCU KL divergence"""
+        # Predicted and target RSCU
+        pred_rscu = self.compute_sequence_rscu(pred_codon_ids, aa_ids, mask)
+        target_rscu = self.compute_sequence_rscu(target_codon_ids, aa_ids, mask)
+        
+        # Species reference distribution
+        B = pred_codon_ids.size(0)
+        ref_rscu = torch.zeros_like(pred_rscu)
+        for b in range(B):
+            sp_idx = species_ids[b].item()
+            if 0 <= sp_idx < len(self.species_list):
+                ref_rscu[b] = self.ref_distributions[sp_idx]
+        
+        # Combined target
+        combined_target = 0.7 * target_rscu + 0.3 * ref_rscu
+        
+        # Smoothing
+        pred_rscu = pred_rscu + 1e-8
+        combined_target = combined_target + 1e-8
+        
+        # Normalization
+        pred_dist = pred_rscu / pred_rscu.sum(dim=1, keepdim=True)
+        target_dist = combined_target / combined_target.sum(dim=1, keepdim=True)
+        
+        # KL divergence
+        kl_div = (target_dist * torch.log(target_dist / pred_dist)).sum(dim=1)
+        
+        return kl_div
+
