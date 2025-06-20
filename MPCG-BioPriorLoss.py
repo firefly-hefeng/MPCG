@@ -220,3 +220,127 @@ class RSCUCalculator(nn.Module):
         
         return kl_div
 
+
+# ==================== Comprehensive Loss Function ====================
+class BiologicallyInformedLoss(nn.Module):
+    """Multi-objective loss based on biological priors"""
+    
+    def __init__(
+        self,
+        codon_data: FiveSpeciesCodonData,
+        weights: Optional[Dict[str, float]] = None,
+        device: str = 'cpu'
+    ):
+        super().__init__()
+        self.codon_data = codon_data
+        self.device = device
+        
+        self.weights = weights or {
+            'ce': 1.0,
+            'cai': 0.4,
+            'rscu': 0.3,
+            'gc': 0.1,
+            'structure': 0.15,
+            'dynamics': 0.1,
+            'rare_codon': 0.2,
+            'manufacturability': 0.05
+        }
+        
+        self.cai_calculator = CAICalculator(codon_data, device)
+        self.rscu_calculator = RSCUCalculator(codon_data, device)
+        
+        self.rare_threshold = 0.6
+    
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_codon_ids: torch.Tensor,
+        aa_ids: torch.Tensor,
+        species_ids: torch.Tensor,
+        features: Optional[Dict[str, torch.Tensor]] = None,
+        mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute comprehensive loss
+        
+        Args:
+            logits: [B, L, V_codon]
+            target_codon_ids: [B, L]
+            aa_ids: [B, L]
+            species_ids: [B]
+            features: dict
+            mask: [B, L]
+        """
+        losses = {}
+        
+        pred_codon_ids = logits.argmax(dim=-1)
+        
+        # 1. Cross-entropy
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            target_codon_ids.reshape(-1),
+            ignore_index=0,
+            reduction='mean'
+        )
+        losses['ce'] = ce_loss
+        
+        # 2. CAI loss
+        pred_cai = self.cai_calculator(pred_codon_ids, species_ids, mask)
+        target_cai = self.cai_calculator(target_codon_ids, species_ids, mask)
+        cai_loss = F.relu(target_cai - pred_cai).mean()
+        losses['cai'] = cai_loss
+        
+        # 3. RSCU loss
+        rscu_loss = self.rscu_calculator(
+            pred_codon_ids, target_codon_ids, aa_ids, species_ids, mask
+        ).mean()
+        losses['rscu'] = rscu_loss
+        
+        # 4. GC content loss
+        if features and 'gc_pred' in features:
+            target_gc = 0.5
+            gc_loss = F.mse_loss(
+                features['gc_pred'].mean(dim=1),
+                torch.full((features['gc_pred'].size(0),), target_gc, device=self.device)
+            )
+            losses['gc'] = gc_loss
+        else:
+            losses['gc'] = torch.tensor(0.0, device=self.device)
+        
+        # 5. RNA structure loss
+        if features and 'mfe' in features:
+            target_mfe = -20.0
+            structure_loss = F.mse_loss(
+                features['mfe'],
+                torch.full_like(features['mfe'], target_mfe)
+            )
+            losses['structure'] = structure_loss
+        else:
+            losses['structure'] = torch.tensor(0.0, device=self.device)
+        
+        # 6. Translation dynamics loss
+        if features and 'pause_prob' in features:
+            pause_target = 0.1
+            pause_loss = F.mse_loss(
+                features['pause_prob'].mean(dim=1),
+                torch.full((features['pause_prob'].size(0),), pause_target, device=self.device)
+            )
+            losses['dynamics'] = pause_loss
+        else:
+            losses['dynamics'] = torch.tensor(0.0, device=self.device)
+        
+        # 7. Rare codon protection
+        rare_codon_loss = self._compute_rare_codon_loss(
+            pred_codon_ids, target_codon_ids, species_ids, mask
+        )
+        losses['rare_codon'] = rare_codon_loss
+        
+        # 8. Manufacturability
+        manufact_loss = self._compute_manufacturability_loss(pred_codon_ids, mask)
+        losses['manufacturability'] = manufact_loss
+        
+        # Total loss
+        total_loss = sum(self.weights.get(k, 0.0) * v for k, v in losses.items())
+        losses['total'] = total_loss
+        
+        return total_loss, losses
