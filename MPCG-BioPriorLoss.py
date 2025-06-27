@@ -344,3 +344,114 @@ class BiologicallyInformedLoss(nn.Module):
         losses['total'] = total_loss
         
         return total_loss, losses
+    
+    def _compute_rare_codon_loss(
+        self,
+        pred_codon_ids: torch.Tensor,
+        target_codon_ids: torch.Tensor,
+        species_ids: torch.Tensor,
+        mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Rare codon protection loss"""
+        from MPCG_BaseCodonFormer import ID2CODON
+        
+        B, L = pred_codon_ids.shape
+        losses = []
+        
+        for b in range(B):
+            sp_idx = species_ids[b].item()
+            if sp_idx >= len(self.rscu_calculator.species_list):
+                continue
+            
+            species = self.rscu_calculator.species_list[sp_idx]
+            rscu_dict = self.codon_data.get_rscu(species)
+            
+            # Identify rare codon clusters
+            rare_clusters = []
+            cluster_start = None
+            
+            for l in range(L):
+                if mask is not None and not mask[b, l]:
+                    continue
+                
+                target_codon_idx = target_codon_ids[b, l].item()
+                if target_codon_idx == 0:
+                    continue
+                
+                target_codon = ID2CODON.get(target_codon_idx)
+                if not target_codon:
+                    continue
+                
+                rscu_value = rscu_dict.get(target_codon, 1.0)
+                
+                if rscu_value < self.rare_threshold:
+                    if cluster_start is None:
+                        cluster_start = l
+                else:
+                    if cluster_start is not None and (l - cluster_start) >= 3:
+                        rare_clusters.append((cluster_start, l))
+                    cluster_start = None
+            
+            if cluster_start is not None and (L - cluster_start) >= 3:
+                rare_clusters.append((cluster_start, L))
+            
+            # Intra-cluster loss
+            cluster_loss = 0.0
+            for start, end in rare_clusters:
+                cluster_pred = pred_codon_ids[b, start:end]
+                cluster_target = target_codon_ids[b, start:end]
+                mismatch = (cluster_pred != cluster_target).float().sum()
+                cluster_loss += mismatch / max(1, end - start)
+            
+            if len(rare_clusters) > 0:
+                cluster_loss /= len(rare_clusters)
+            
+            losses.append(cluster_loss)
+        
+        if losses:
+            return torch.stack([torch.tensor(l, device=self.device) for l in losses]).mean()
+        else:
+            return torch.tensor(0.0, device=self.device)
+    
+    def _compute_manufacturability_loss(
+        self,
+        codon_ids: torch.Tensor,
+        mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Manufacturability loss"""
+        B, L = codon_ids.shape
+        losses = []
+        
+        for b in range(B):
+            seq = codon_ids[b]
+            if mask is not None:
+                seq = seq[mask[b]]
+            
+            if len(seq) < 6:
+                losses.append(torch.tensor(0.0, device=self.device))
+                continue
+            
+            # Triplet repeats
+            repeat_penalty = 0
+            for i in range(len(seq) - 5):
+                if torch.equal(seq[i:i+3], seq[i+3:i+6]):
+                    repeat_penalty += 1
+            repeat_penalty = repeat_penalty / max(1, len(seq) - 5)
+            
+            # Homopolymers
+            homopolymer_penalty = 0
+            current_run = 1
+            for i in range(1, len(seq)):
+                if seq[i] == seq[i-1]:
+                    current_run += 1
+                    if current_run >= 4:
+                        homopolymer_penalty += 1
+                else:
+                    current_run = 1
+            homopolymer_penalty = homopolymer_penalty / max(1, len(seq))
+            
+            total_loss = repeat_penalty + homopolymer_penalty
+            losses.append(torch.tensor(total_loss, device=self.device))
+        
+        return torch.stack(losses).mean()
+
