@@ -126,3 +126,56 @@ class CodonOptimizer:
             'gc_content': gc_content,
             'length': len(optimized_codons)
         }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MPCG-Codon Inference")
+    parser.add_argument('--checkpoint', type=str, required=True,
+                       help='Path to model checkpoint')
+    parser.add_argument('--protein', type=str, required=True,
+                       help='Protein sequence (amino acids)')
+    parser.add_argument('--species', type=str, required=True,
+                       choices=['Homo sapiens', 'Mus musculus',
+                               'Escherichia coli', 'Saccharomyces cerevisiae',
+                               'Pichia angusta'],
+                       help='Target species')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                       help='Sampling temperature')
+    parser.add_argument('--output', type=str, default='optimized.fasta',
+                       help='Output file path')
+    
+    args = parser.parse_args()
+    
+    # Create optimizer
+    optimizer = CodonOptimizer(args.checkpoint)
+    
+    # Optimize sequence
+    result = optimizer.optimize(
+        args.protein,
+        args.species,
+        args.temperature
+    )
+    
+    # Print results
+    print("\n" + "="*80)
+    print("Optimization Results")
+    print("="*80)
+    print(f"Target Species: {result['target_species']}")
+    print(f"Protein Length: {result['length']} aa")
+    print(f"CAI: {result['cai']:.4f}")
+    print(f"GC Content: {result['gc_content']*100:.2f}%")
+    print(f"\nOptimized DNA Sequence:")
+    print(result['optimized_dna'])
+    
+    # Save to file
+    with open(args.output, 'w') as f:
+        f.write(f">Optimized for {result['target_species']} | CAI={result['cai']:.4f}\n")
+        # 60 characters per line
+        for i in range(0, len(result['optimized_dna']), 60):
+            f.write(result['optimized_dna'][i:i+60] + '\n')
+    
+    print(f"\nResults saved to {args.output}")
+
+
+if __name__ == '__main__':
+    main()
