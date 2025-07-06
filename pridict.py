@@ -86,3 +86,85 @@ class CodonPredictor:
         print(f"Model loaded successfully!")
         print(f"Available species: {self.codon_data.species_list}")
         print(f"Using device: {self.device}")
+    
+    def predict_single(
+        self,
+        protein_sequence: str,
+        target_species: str,
+        return_probs: bool = False
+    ) -> Dict:
+        """
+        Predict a single protein sequence
+        
+        Args:
+            protein_sequence: Amino acid sequence
+            target_species: Target species
+            return_probs: Whether to return probability distribution
+        
+        Returns:
+            Prediction result dictionary
+        """
+        # Ensure terminator is present
+        if not protein_sequence.endswith('*'):
+            protein_sequence += '*'
+        
+        # Convert to IDs
+        aa_ids = aa_to_ids(protein_sequence)
+        aa_tensor = torch.tensor([aa_ids], dtype=torch.long).to(self.device)
+        
+        # Species ID
+        try:
+            sp_idx = self.codon_data.species_list.index(target_species)
+        except ValueError:
+            raise ValueError(
+                f"Unknown species: {target_species}. "
+                f"Available: {self.codon_data.species_list}"
+            )
+        
+        sp_tensor = torch.tensor([sp_idx], dtype=torch.long).to(self.device)
+        
+        # Auxiliary features (simplified)
+        aux_features = torch.zeros(1, 64).to(self.device)
+        
+        # Forward pass
+        with torch.no_grad():
+            logits, features = self.model(
+                aa_ids=aa_tensor,
+                mask=(aa_tensor == 0),
+                species_ids=sp_tensor,
+                aux_features=aux_features,
+                return_features=True
+            )
+        
+        # Sample codons
+        probs = torch.softmax(logits / self.temperature, dim=-1)
+        codon_ids = torch.multinomial(
+            probs.view(-1, probs.size(-1)),
+            num_samples=1
+        ).view(1, -1)
+        
+        # Convert to codon sequence
+        codon_ids_list = codon_ids[0].cpu().tolist()
+        valid_ids = [i for i in codon_ids_list if i not in (0, 1, 2)]
+        optimized_codons = ids_to_codons(valid_ids)
+        
+        # Build DNA sequence
+        optimized_dna = ''.join(optimized_codons)
+        
+        # Calculate metrics
+        metrics = self._calculate_metrics(
+            optimized_codons, target_species, optimized_dna
+        )
+        
+        result = {
+            'protein_sequence': protein_sequence,
+            'optimized_dna': optimized_dna,
+            'optimized_codons': optimized_codons,
+            'target_species': target_species,
+            'metrics': metrics
+        }
+        
+        if return_probs:
+            result['probabilities'] = probs[0].cpu().numpy()
+        
+        return result
