@@ -168,3 +168,68 @@ class CodonPredictor:
             result['probabilities'] = probs[0].cpu().numpy()
         
         return result
+    
+    def predict_batch(
+        self,
+        sequences: List[str],
+        target_species: str,
+        show_progress: bool = True
+    ) -> List[Dict]:
+        """
+        Batch prediction
+        
+        Args:
+            sequences: List of amino acid sequences
+            target_species: Target species
+            show_progress: Whether to show progress bar
+        
+        Returns:
+            List of prediction results
+        """
+        results = []
+        
+        iterator = tqdm(sequences) if show_progress else sequences
+        
+        for seq in iterator:
+            try:
+                result = self.predict_single(seq, target_species)
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing sequence: {e}")
+                results.append({
+                    'protein_sequence': seq,
+                    'error': str(e)
+                })
+        
+        return results
+    
+    def _calculate_metrics(
+        self,
+        codons: List[str],
+        species: str,
+        dna_seq: str
+    ) -> Dict:
+        """Calculate optimization metrics"""
+        metrics = {}
+        
+        # CAI
+        cai_weights = self.codon_data.get_cai_weights(species)
+        cai_values = [cai_weights.get(c, 0.5) for c in codons]
+        metrics['cai'] = float(np.exp(np.mean([np.log(max(v, 1e-8)) for v in cai_values])))
+        
+        # GC content
+        metrics['gc_content'] = float(self.feature_extractor.calculate_gc_content(dna_seq))
+        
+        # RSCU
+        rscu_dict = self.feature_extractor.calculate_rscu(codons)
+        metrics['mean_rscu'] = float(np.mean(list(rscu_dict.values())))
+        
+        # Sequence length
+        metrics['length'] = len(codons)
+        
+        # Rare codon ratio
+        rscu_ref = self.codon_data.get_rscu(species)
+        rare_count = sum(1 for c in codons if rscu_ref.get(c, 1.0) < 0.6)
+        metrics['rare_codon_ratio'] = float(rare_count / len(codons))
+        
+        return metrics
