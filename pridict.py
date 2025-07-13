@@ -233,3 +233,109 @@ class CodonPredictor:
         metrics['rare_codon_ratio'] = float(rare_count / len(codons))
         
         return metrics
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="MPCG-Codon Prediction Script",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        '--checkpoint', type=str, required=True,
+        help='Path to model checkpoint'
+    )
+    
+    parser.add_argument(
+        '--species', type=str, required=True,
+        choices=[
+            'Homo sapiens',
+            'Mus musculus',
+            'Escherichia coli',
+            'Saccharomyces cerevisiae',
+            'Pichia angusta'
+        ],
+        help='Target species'
+    )
+    
+    # Input methods (choose one)'
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        '--protein', type=str,
+        help='Single protein sequence (amino acids)'
+    )
+    input_group.add_argument(
+        '--fasta', type=str,
+        help='Path to FASTA format file'
+    )
+    input_group.add_argument(
+        '--csv', type=str,
+        help='Path to CSV file (must contain protein_sequence column)'
+    )
+    
+    # Output arguments
+    parser.add_argument(
+        '--output', type=str, default='predictions.fasta',
+        help='Output file path'
+    )
+    parser.add_argument(
+        '--output_format', type=str, default='fasta',
+        choices=['fasta', 'csv', 'json'],
+        help='Output format'
+    )
+    
+    # Prediction arguments
+    parser.add_argument(
+        '--temperature', type=float, default=1.0,
+        help='Sampling temperature (higher values increase diversity)'
+    )
+    parser.add_argument(
+        '--device', type=str, default='cuda',
+        choices=['cuda', 'cpu'],
+        help='Computing device'
+    )
+    parser.add_argument(
+        '--batch_size', type=int, default=1,
+        help='Batch size (currently only 1 is supported)'
+    )
+    
+    # Other arguments
+    parser.add_argument(
+        '--verbose', action='store_true',
+        help='Show verbose information'
+    )
+    
+    return parser.parse_args()
+
+
+def load_sequences_from_fasta(fasta_path: str) -> List[Dict]:
+    """Load sequences from FASTA file"""
+    sequences = []
+    current_header = None
+    current_seq = []
+    
+    with open(fasta_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('>'):
+                if current_header is not None:
+                    sequences.append({
+                        'header': current_header,
+                        'sequence': ''.join(current_seq)
+                    })
+                current_header = line[1:]
+                current_seq = []
+            else:
+                current_seq.append(line)
+        
+        # Last sequence
+        if current_header is not None:
+            sequences.append({
+                'header': current_header,
+                'sequence': ''.join(current_seq)
+            })
+    
+    return sequences
+
