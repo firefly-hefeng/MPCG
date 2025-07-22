@@ -339,3 +339,157 @@ def load_sequences_from_fasta(fasta_path: str) -> List[Dict]:
     
     return sequences
 
+
+def save_results_fasta(results: List[Dict], output_path: str):
+    """Save results in FASTA format"""
+    with open(output_path, 'w') as f:
+        for i, result in enumerate(results):
+            if 'error' in result:
+                continue
+            
+            header = (
+                f">Optimized_{i+1} | Species={result['target_species']} | "
+                f"CAI={result['metrics']['cai']:.4f} | "
+                f"GC={result['metrics']['gc_content']*100:.2f}%"
+            )
+            f.write(header + '\n')
+            
+            # 60 characters per line
+            dna = result['optimized_dna']
+            for j in range(0, len(dna), 60):
+                f.write(dna[j:j+60] + '\n')
+
+
+def save_results_csv(results: List[Dict], output_path: str):
+    """Save results in CSV format"""
+    data = []
+    for i, result in enumerate(results):
+        if 'error' in result:
+            data.append({
+                'id': i + 1,
+                'protein_sequence': result.get('protein_sequence', ''),
+                'error': result['error']
+            })
+        else:
+            row = {
+                'id': i + 1,
+                'protein_sequence': result['protein_sequence'],
+                'optimized_dna': result['optimized_dna'],
+                'target_species': result['target_species'],
+                **{f"metric_{k}": v for k, v in result['metrics'].items()}
+            }
+            data.append(row)
+    
+    df = pd.DataFrame(data)
+    df.to_csv(output_path, index=False)
+
+
+def save_results_json(results: List[Dict], output_path: str):
+    """Save results in JSON format"""
+    # Convert numpy types to Python native types
+    def convert_types(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        return obj
+    
+    clean_results = []
+    for result in results:
+        clean_result = {}
+        for k, v in result.items():
+            if isinstance(v, dict):
+                clean_result[k] = {kk: convert_types(vv) for kk, vv in v.items()}
+            else:
+                clean_result[k] = convert_types(v)
+        clean_results.append(clean_result)
+    
+    with open(output_path, 'w') as f:
+        json.dump(clean_results, f, indent=2)
+
+
+def main():
+    """Main prediction workflow"""
+    args = parse_args()
+    
+    print("="*80)
+    print("MPCG-Codon Prediction Script")
+    print("="*80)
+    
+    # Create predictor
+    predictor = CodonPredictor(
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        temperature=args.temperature
+    )
+    
+    # Load input sequences
+    sequences = []
+    
+    if args.protein:
+        sequences = [{'header': 'Input', 'sequence': args.protein}]
+    
+    elif args.fasta:
+        print(f"Loading sequences from {args.fasta}...")
+        sequences = load_sequences_from_fasta(args.fasta)
+        print(f"Loaded {len(sequences)} sequences")
+    
+    elif args.csv:
+        print(f"Loading sequences from {args.csv}...")
+        df = pd.read_csv(args.csv)
+        if 'protein_sequence' not in df.columns:
+            print("Error: CSV must contain 'protein_sequence' column")
+            sys.exit(1)
+        sequences = [
+            {'header': f"Seq_{i+1}", 'sequence': seq}
+            for i, seq in enumerate(df['protein_sequence'])
+        ]
+        print(f"Loaded {len(sequences)} sequences")
+    
+    # Run prediction
+    print(f"\nPredicting for species: {args.species}")
+    print("-"*80)
+    
+    seq_list = [s['sequence'] for s in sequences]
+    results = predictor.predict_batch(
+        seq_list,
+        args.species,
+        show_progress=True
+    )
+    
+    # Print statistics
+    print("\n" + "="*80)
+    print("Prediction Summary")
+    print("="*80)
+    
+    successful = [r for r in results if 'error' not in r]
+    failed = [r for r in results if 'error' in r]
+    
+    print(f"Total sequences: {len(results)}")
+    print(f"Successful: {len(successful)}")
+    print(f"Failed: {len(failed)}")
+    
+    if successful:
+        avg_cai = np.mean([r['metrics']['cai'] for r in successful])
+        avg_gc = np.mean([r['metrics']['gc_content'] for r in successful])
+        print(f"\nAverage CAI: {avg_cai:.4f}")
+        print(f"Average GC content: {avg_gc*100:.2f}%")
+    
+    # Save results
+    print(f"\nSaving results to {args.output}...")
+    
+    if args.output_format == 'fasta':
+        save_results_fasta(results, args.output)
+    elif args.output_format == 'csv':
+        save_results_csv(results, args.output)
+    elif args.output_format == 'json':
+        save_results_json(results, args.output)
+    
+    print("Done!")
+    print("="*80)
+
+
+if __name__ == '__main__':
+    main()
