@@ -437,3 +437,177 @@ class DisulfideBondAwareModule(nn.Module):
         
         return all_pairs
 
+
+# ==================== Solubility Optimization Module ====================
+class SolubilityOptimizationModule(nn.Module):
+    """Protein solubility optimization module"""
+    
+    def __init__(self, config: SPEAConfig):
+        super().__init__()
+        self.config = config
+        
+        # Hydrophobicity prediction
+        self.hydrophobicity_predictor = nn.Sequential(
+            nn.Linear(config.d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+        
+        # Aggregation tendency prediction
+        self.aggregation_predictor = nn.GRU(
+            config.d_model,
+            config.d_model // 2,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=config.dropout
+        )
+        
+        # Solubility tag enhancement
+        self.solubility_tags = nn.ModuleDict({
+            'SUMO': nn.Linear(20, config.d_model),  # SUMO tag embedding
+            'MBP': nn.Linear(20, config.d_model),   # MBP tag embedding
+            'GST': nn.Linear(20, config.d_model),   # GST tag embedding
+            'TRX': nn.Linear(20, config.d_model)    # Thioredoxin tag
+        })
+        
+        # Codon optimizer (avoid rare codon clusters)
+        self.codon_optimizer = nn.Sequential(
+            nn.Linear(config.d_model + 64, config.d_model),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, config.d_model)
+        )
+        
+        # E. coli rare codon table
+        self.rare_codons = {
+            'AGA', 'AGG',  # Arg
+            'AUA',         # Ile
+            'CUA',         # Leu
+            'CCC',         # Pro
+            'GGA'          # Gly
+        }
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        aa_ids: torch.Tensor,
+        codon_logits: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Optimize protein solubility
+        """
+        B, L, D = hidden_states.shape
+        device = hidden_states.device
+        
+        # Predict hydrophobicity
+        hydrophobicity = self.hydrophobicity_predictor(hidden_states).squeeze(-1)
+        
+        # Predict aggregation tendency
+        aggregation_hidden, _ = self.aggregation_predictor(hidden_states)
+        aggregation_score = torch.sigmoid(aggregation_hidden[:, :, :D//2].mean(dim=-1))
+        
+        # Compute solubility score
+        solubility_score = self._compute_solubility_score(
+            aa_ids, hydrophobicity, aggregation_score
+        )
+        
+        # Suggest adding tags if solubility is low
+        suggested_tags = self._suggest_solubility_tags(solubility_score)
+        
+        # Optimize codon selection to improve solubility
+        if codon_logits is not None:
+            codon_features = self._extract_codon_features(codon_logits)
+            combined_features = torch.cat([hidden_states, codon_features], dim=-1)
+            optimized_hidden = self.codon_optimizer(combined_features)
+        else:
+            optimized_hidden = hidden_states
+        
+        # Avoid rare codons in hydrophobic regions
+        hydrophobic_mask = (hydrophobicity > 0.7).unsqueeze(-1)
+        output = torch.where(
+            hydrophobic_mask,
+            optimized_hidden,
+            hidden_states
+        )
+        
+        outputs = {
+            'hidden_states': output,
+            'hydrophobicity': hydrophobicity,
+            'aggregation_score': aggregation_score,
+            'solubility_score': solubility_score,
+            'suggested_tags': suggested_tags
+        }
+        
+        return output, outputs
+    
+    def _compute_solubility_score(
+        self,
+        aa_ids: torch.Tensor,
+        hydrophobicity: torch.Tensor,
+        aggregation_score: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute solubility score"""
+        B = aa_ids.size(0)
+        scores = []
+        
+        for b in range(B):
+            # Base score
+            score = 1.0
+            
+            # Hydrophobicity penalty
+            mean_hydrophobicity = hydrophobicity[b].mean().item()
+            score -= self.config.hydrophobicity_penalty * mean_hydrophobicity
+            
+            # Aggregation tendency penalty
+            mean_aggregation = aggregation_score[b].mean().item()
+            score -= 0.3 * mean_aggregation
+            
+            # Amino acid composition adjustment
+            aa_seq = ''.join([ID2AA.get(aa_ids[b, i].item(), '') 
+                            for i in range(aa_ids.size(1)) if aa_ids[b, i] > 2])
+            
+            # Charged residues favor solubility
+            charged_ratio = sum(1 for aa in aa_seq if aa in 'DEKR') / max(1, len(aa_seq))
+            score += 0.2 * charged_ratio
+            
+            # Aromatic residues disfavor solubility
+            aromatic_ratio = sum(1 for aa in aa_seq if aa in 'FYW') / max(1, len(aa_seq))
+            score -= 0.15 * aromatic_ratio
+            
+            scores.append(max(0, min(1, score)))
+        
+        return torch.tensor(scores, device=aa_ids.device)
+    
+    def _suggest_solubility_tags(self, solubility_score: torch.Tensor) -> List[str]:
+        """Recommend tags based on solubility score"""
+        suggestions = []
+        
+        for score in solubility_score:
+            if score < 0.3:
+                suggestions.append('MBP')  # Strongest solubility tag
+            elif score < 0.5:
+                suggestions.append('SUMO')
+            elif score < 0.7:
+                suggestions.append('TRX')
+            else:
+                suggestions.append('None')
+        
+        return suggestions
+    
+    def _extract_codon_features(self, codon_logits: torch.Tensor) -> torch.Tensor:
+        """Extract codon features"""
+        B, L, V = codon_logits.shape
+        
+        # Simplified: return top-k codon probabilities
+        top_k = 64
+        top_probs, _ = torch.topk(F.softmax(codon_logits, dim=-1), k=min(top_k, V), dim=-1)
+        
+        # Pad to fixed dimension
+        if top_probs.size(-1) < top_k:
+            padding = torch.zeros(B, L, top_k - top_probs.size(-1), device=codon_logits.device)
+            top_probs = torch.cat([top_probs, padding], dim=-1)
+        
+        return top_probs
+
