@@ -611,3 +611,229 @@ class SolubilityOptimizationModule(nn.Module):
         
         return top_probs
 
+
+# ==================== Combined Fine-tuning Loss ====================
+class SPEALoss(nn.Module):
+    """Secreted Protein Expression Adapter Loss"""
+    
+    def __init__(self, config: SPEAConfig, codon_data: FiveSpeciesCodonData):
+        super().__init__()
+        self.config = config
+        self.codon_data = codon_data
+        
+        # Base loss weights
+        self.loss_weights = {
+            'ce': 1.0,
+            'signal': 0.3,
+            'cleavage': 0.2,
+            'disulfide': 0.25,
+            'solubility': 0.3,
+            'ecoli_adaptation': 0.2,
+            'rare_codon': 0.15
+        }
+    
+    def forward(
+        self,
+        codon_logits: torch.Tensor,
+        target_codons: torch.Tensor,
+        aa_ids: torch.Tensor,
+        spea_outputs: Dict[str, Dict],
+        position_labels: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute combined loss
+        """
+        losses = {}
+        
+        # 1. Base cross-entropy loss
+        ce_loss = F.cross_entropy(
+            codon_logits.reshape(-1, codon_logits.size(-1)),
+            target_codons.reshape(-1),
+            ignore_index=0
+        )
+        losses['ce'] = ce_loss
+        
+        # 2. Signal peptide region loss
+        if 'signal_adapter' in spea_outputs:
+            signal_out = spea_outputs['signal_adapter']
+            
+            # Region classification loss
+            if position_labels is not None:
+                region_loss = F.cross_entropy(
+                    signal_out['region_probs'].reshape(-1, 3),
+                    position_labels.reshape(-1),
+                    ignore_index=0
+                )
+                losses['signal'] = region_loss
+            
+            # Cleavage site loss
+            if 'cleavage_probs' in signal_out:
+                # Assume cleavage site is at the end of signal peptide
+                cleavage_target = self._get_cleavage_targets(position_labels)
+                if cleavage_target is not None:
+                    cleavage_loss = F.binary_cross_entropy(
+                        signal_out['cleavage_probs'],
+                        cleavage_target
+                    )
+                    losses['cleavage'] = cleavage_loss
+        
+        # 3. Disulfide bond loss
+        if 'disulfide' in spea_outputs:
+            disulfide_out = spea_outputs['disulfide']
+            disulfide_loss = self._compute_disulfide_loss(
+                codon_logits, aa_ids, disulfide_out
+            )
+            losses['disulfide'] = disulfide_loss
+        
+        # 4. Solubility loss
+        if 'solubility' in spea_outputs:
+            sol_out = spea_outputs['solubility']
+            solubility_loss = self._compute_solubility_loss(
+                codon_logits, sol_out
+            )
+            losses['solubility'] = solubility_loss
+        
+        # 5. E. coli adaptation loss
+        ecoli_loss = self._compute_ecoli_adaptation_loss(codon_logits, aa_ids)
+        losses['ecoli_adaptation'] = ecoli_loss
+        
+        # 6. Rare codon loss
+        rare_codon_loss = self._compute_rare_codon_loss(codon_logits)
+        losses['rare_codon'] = rare_codon_loss
+        
+        # Total loss
+        total_loss = sum(self.loss_weights.get(k, 0) * v for k, v in losses.items())
+        losses['total'] = total_loss
+        
+        return total_loss, losses
+    
+    def _get_cleavage_targets(self, position_labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Get cleavage site targets"""
+        if position_labels is None:
+            return None
+        
+        B, L = position_labels.shape
+        targets = torch.zeros(B, L-1, device=position_labels.device)
+        
+        for b in range(B):
+            # Find the transition point from signal peptide to mature protein
+            for i in range(L-1):
+                if position_labels[b, i] == 1 and position_labels[b, i+1] == 2:
+                    targets[b, i] = 1.0
+                    break
+        
+        return targets
+    
+    def _compute_disulfide_loss(
+        self,
+        codon_logits: torch.Tensor,
+        aa_ids: torch.Tensor,
+        disulfide_outputs: Dict
+    ) -> torch.Tensor:
+        """Compute disulfide bond related loss"""
+        device = codon_logits.device
+        total_loss = torch.tensor(0.0, device=device)
+        
+        # Avoid rare codons at cysteine positions
+        cys_positions = disulfide_outputs.get('cys_positions', [])
+        
+        for b, positions in enumerate(cys_positions):
+            if len(positions) > 0:
+                for pos in positions:
+                    # Get codon probabilities at this position
+                    codon_probs = F.softmax(codon_logits[b, pos], dim=-1)
+                    
+                    # Penalize use of rare cysteine codons
+                    # TGC is more commonly used than TGT in E. coli
+                    tgt_id = CODON2ID.get('TGT', 0)
+                    tgc_id = CODON2ID.get('TGC', 0)
+                    
+                    if tgt_id > 0 and tgc_id > 0:
+                        # Encourage use of TGC
+                        loss = -torch.log(codon_probs[tgc_id] + 1e-8)
+                        total_loss = total_loss + loss * 0.1
+        
+        return total_loss / max(1, len(cys_positions))
+    
+    def _compute_solubility_loss(
+        self,
+        codon_logits: torch.Tensor,
+        solubility_outputs: Dict
+    ) -> torch.Tensor:
+        """Compute solubility related loss"""
+        solubility_score = solubility_outputs.get('solubility_score')
+        
+        if solubility_score is None:
+            return torch.tensor(0.0, device=codon_logits.device)
+        
+        # Increase constraints on codon optimization if solubility is low
+        low_solubility_mask = (solubility_score < self.config.solubility_threshold)
+        
+        if low_solubility_mask.any():
+            # Compute codon diversity (avoid overuse of certain codons)
+            codon_probs = F.softmax(codon_logits, dim=-1)
+            entropy = -(codon_probs * torch.log(codon_probs + 1e-8)).sum(dim=-1)
+            
+            # Encourage higher codon diversity when solubility is low
+            diversity_loss = -entropy[low_solubility_mask].mean()
+            
+            return diversity_loss * 0.1
+        
+        return torch.tensor(0.0, device=codon_logits.device)
+    
+    def _compute_ecoli_adaptation_loss(
+        self,
+        codon_logits: torch.Tensor,
+        aa_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute E. coli adaptation loss"""
+        signal_db = SignalPeptideDB()
+        B, L, V = codon_logits.shape
+        device = codon_logits.device
+        
+        total_loss = torch.tensor(0.0, device=device)
+        
+        for b in range(B):
+            for l in range(L):
+                aa_id = aa_ids[b, l].item()
+                if aa_id > 2:  # Skip special tokens
+                    aa = ID2AA.get(aa_id, '')
+                    if aa in signal_db.ecoli_optimal_codons:
+                        optimal_codons = signal_db.ecoli_optimal_codons[aa]
+                        
+                        # Get codon probabilities at this position
+                        codon_probs = F.softmax(codon_logits[b, l], dim=-1)
+                        
+                        # Compute total probability of optimal codons
+                        optimal_prob = 0
+                        for codon in optimal_codons:
+                            if codon in CODON2ID:
+                                codon_id = CODON2ID[codon]
+                                optimal_prob += codon_probs[codon_id]
+                        
+                        # Encourage use of optimal codons
+                        loss = -torch.log(optimal_prob + 1e-8)
+                        total_loss = total_loss + loss
+        
+        return total_loss / (B * L)
+    
+    def _compute_rare_codon_loss(self, codon_logits: torch.Tensor) -> torch.Tensor:
+        """Compute rare codon loss"""
+        # E. coli rare codons
+        rare_codon_ids = [CODON2ID.get(c, 0) for c in ['AGA', 'AGG', 'AUA', 'CUA', 'CCC', 'GGA']]
+        rare_codon_ids = [c for c in rare_codon_ids if c > 0]
+        
+        if not rare_codon_ids:
+            return torch.tensor(0.0, device=codon_logits.device)
+        
+        # Compute usage probability of rare codons
+        codon_probs = F.softmax(codon_logits, dim=-1)
+        rare_probs = codon_probs[:, :, rare_codon_ids].sum(dim=-1)
+        
+        # Penalize consecutive rare codons
+        consecutive_penalty = 0
+        for i in range(rare_probs.size(1) - 1):
+            consecutive = rare_probs[:, i] * rare_probs[:, i+1]
+            consecutive_penalty += consecutive.mean()
+        
+        return consecutive_penalty
