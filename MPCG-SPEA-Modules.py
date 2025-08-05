@@ -281,3 +281,159 @@ class SecretionSignalAdapter(nn.Module):
         
         return bias / (len(CODON2ID) + 1e-8)
 
+
+# ==================== Disulfide Bond Aware Module ====================
+class DisulfideBondAwareModule(nn.Module):
+    """Disulfide bond formation optimization module"""
+    
+    def __init__(self, config: SPEAConfig):
+        super().__init__()
+        self.config = config
+        
+        # Cysteine pair pairing prediction
+        self.cys_pair_predictor = nn.Bilinear(
+            config.d_model, config.d_model, 128
+        )
+        self.pair_classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+        # Redox environment optimization
+        self.redox_optimizer = nn.LSTM(
+            config.d_model,
+            config.d_model // 2,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=config.dropout
+        )
+        
+        # Local structure stabilization
+        self.local_structure_conv = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=2 * config.disulfide_context_window + 1,
+            padding=config.disulfide_context_window
+        )
+        
+        # DsbA/DsbC cofactor simulation
+        self.dsb_factor = nn.Parameter(torch.randn(config.d_model) * 0.1)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        aa_ids: torch.Tensor,
+        signal_outputs: Optional[Dict] = None
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Optimize expression of disulfide-bond-containing proteins
+        """
+        B, L, D = hidden_states.shape
+        device = hidden_states.device
+        
+        # Find all cysteine positions
+        cys_positions_batch = []
+        for b in range(B):
+            cys_pos = (aa_ids[b] == AA2ID.get('C', -1)).nonzero(as_tuple=False).squeeze(-1)
+            cys_positions_batch.append(cys_pos)
+        
+        # Predict disulfide bond pairings
+        disulfide_pairs = self._predict_disulfide_pairs(
+            hidden_states, cys_positions_batch
+        )
+        
+        # Optimize redox environment
+        optimized_hidden, _ = self.redox_optimizer(hidden_states)
+        
+        # Enhance optimization around cysteines
+        cys_enhanced = hidden_states.clone()
+        for b, cys_positions in enumerate(cys_positions_batch):
+            if len(cys_positions) > 0:
+                for pos in cys_positions:
+                    # Define context window
+                    start = max(0, pos - self.config.disulfide_context_window)
+                    end = min(L, pos + self.config.disulfide_context_window + 1)
+                    
+                    # Apply optimization
+                    cys_enhanced[b, start:end] = (
+                        hidden_states[b, start:end] + 
+                        self.config.cys_optimization_strength * optimized_hidden[b, start:end]
+                    )
+                    
+                    # Add DsbA factor (promotes disulfide bond formation)
+                    cys_enhanced[b, pos] += self.dsb_factor
+        
+        # Local structure stabilization
+        structure_enhanced = self.local_structure_conv(
+            cys_enhanced.transpose(1, 2)
+        ).transpose(1, 2)
+        
+        # Mix enhancements
+        output = hidden_states + 0.3 * (cys_enhanced - hidden_states) + 0.2 * (structure_enhanced - hidden_states)
+        
+        outputs = {
+            'hidden_states': output,
+            'disulfide_pairs': disulfide_pairs,
+            'cys_positions': cys_positions_batch,
+            'redox_optimized': optimized_hidden
+        }
+        
+        return output, outputs
+    
+    def _predict_disulfide_pairs(
+        self,
+        hidden_states: torch.Tensor,
+        cys_positions_batch: List[torch.Tensor]
+    ) -> List[List[Tuple[int, int, float]]]:
+        """Predict disulfide bond pairings"""
+        all_pairs = []
+        
+        for b, cys_positions in enumerate(cys_positions_batch):
+            pairs = []
+            n_cys = len(cys_positions)
+            
+            if n_cys >= 2:
+                # Calculate all possible pairings
+                for i in range(n_cys):
+                    for j in range(i + 1, n_cys):
+                        pos_i = cys_positions[i].item()
+                        pos_j = cys_positions[j].item()
+                        
+                        # Extract features
+                        feat_i = hidden_states[b, pos_i]
+                        feat_j = hidden_states[b, pos_j]
+                        
+                        # Predict pairing probability
+                        pair_features = self.cys_pair_predictor(
+                            feat_i.unsqueeze(0), feat_j.unsqueeze(0)
+                        )
+                        pair_prob = self.pair_classifier(pair_features).item()
+                        
+                        # Distance constraint (disulfide bonds usually have some distance in sequence)
+                        distance = abs(pos_j - pos_i)
+                        if distance < 2:  # Cysteines too close are unlikely to form disulfide bonds
+                            pair_prob *= 0.1
+                        
+                        pairs.append((pos_i, pos_j, pair_prob))
+                
+                # Sort and select most likely pairings (avoid conflicts)
+                pairs.sort(key=lambda x: x[2], reverse=True)
+                selected_pairs = []
+                used_positions = set()
+                
+                for pos_i, pos_j, prob in pairs:
+                    if pos_i not in used_positions and pos_j not in used_positions:
+                        if prob > 0.5:  # Threshold
+                            selected_pairs.append((pos_i, pos_j, prob))
+                            used_positions.add(pos_i)
+                            used_positions.add(pos_j)
+                
+                pairs = selected_pairs
+            
+            all_pairs.append(pairs)
+        
+        return all_pairs
+
