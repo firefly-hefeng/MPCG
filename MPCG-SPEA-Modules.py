@@ -837,3 +837,136 @@ class SPEALoss(nn.Module):
             consecutive_penalty += consecutive.mean()
         
         return consecutive_penalty
+
+
+# ==================== Complete SPEA Fine-Tuner ====================
+class SPEAFineTuner(nn.Module):
+    """Secreted Protein Expression Adapter Fine-Tuner"""
+    
+    def __init__(
+        self,
+        base_model: nn.Module,
+        config: SPEAConfig,
+        codon_data: FiveSpeciesCodonData,
+        freeze_base: bool = True
+    ):
+        super().__init__()
+        
+        self.base_model = base_model
+        self.config = config
+        self.codon_data = codon_data
+        
+        # Freeze most parameters of the base model
+        if freeze_base:
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+            
+            # Only unfreeze the last 3 layers
+            if hasattr(self.base_model, 'layers'):
+                for layer in self.base_model.layers[-3:]:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+        
+        # Add SPEA modules
+        self.signal_adapter = SecretionSignalAdapter(config)
+        self.disulfide_module = DisulfideBondAwareModule(config)
+        self.solubility_module = SolubilityOptimizationModule(config)
+        
+        # Feature fusion layer
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(config.d_model * 3, config.d_model * 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model * 2, config.d_model)
+        )
+        
+        # Loss function
+        self.criterion = SPEALoss(config, codon_data)
+    
+    def forward(
+        self,
+        aa_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        species_ids: Optional[torch.Tensor] = None,
+        aux_features: Optional[torch.Tensor] = None,
+        position_labels: Optional[torch.Tensor] = None,
+        target_codons: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass
+        """
+        # Get initial representations through base model
+        with torch.set_grad_enabled(not self.training or not all(
+            not p.requires_grad for p in self.base_model.parameters()
+        )):
+            base_outputs = self.base_model(
+                aa_ids=aa_ids,
+                mask=mask,
+                species_ids=species_ids,
+                aux_features=aux_features,
+                return_features=True
+            )
+            
+            if isinstance(base_outputs, tuple):
+                codon_logits, base_features = base_outputs
+                hidden_states = base_features.get('final_hidden', codon_logits)
+            else:
+                codon_logits = base_outputs
+                hidden_states = codon_logits
+        
+        # SPEA module processing
+        spea_outputs = {}
+        
+        # 1. Signal peptide adaptation
+        signal_hidden, signal_outputs = self.signal_adapter(
+            hidden_states, aa_ids, position_labels
+        )
+        spea_outputs['signal_adapter'] = signal_outputs
+        
+        # 2. Disulfide bond optimization
+        disulfide_hidden, disulfide_outputs = self.disulfide_module(
+            signal_hidden, aa_ids, signal_outputs
+        )
+        spea_outputs['disulfide'] = disulfide_outputs
+        
+        # 3. Solubility optimization
+        solubility_hidden, solubility_outputs = self.solubility_module(
+            disulfide_hidden, aa_ids, codon_logits
+        )
+        spea_outputs['solubility'] = solubility_outputs
+        
+        # Feature fusion
+        fused_features = torch.cat([
+            signal_hidden,
+            disulfide_hidden,
+            solubility_hidden
+        ], dim=-1)
+        
+        final_hidden = self.fusion_layer(fused_features)
+        
+        # Generate final codon predictions
+        if hasattr(self.base_model, 'output_proj'):
+            final_logits = self.base_model.output_proj(final_hidden)
+        else:
+            final_logits = final_hidden
+        
+        # Compute loss
+        if target_codons is not None:
+            loss, loss_dict = self.criterion(
+                final_logits,
+                target_codons,
+                aa_ids,
+                spea_outputs,
+                position_labels
+            )
+        else:
+            loss = None
+            loss_dict = {}
+        
+        return {
+            'logits': final_logits,
+            'loss': loss,
+            'loss_dict': loss_dict,
+            'spea_outputs': spea_outputs,
+            'hidden_states': final_hidden
+        }
