@@ -121,3 +121,80 @@ def collate_fn(batch):
         'protein_ids': protein_ids
     }
 
+
+def train_spea(args):
+    """Train SPEA model"""
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load pretrained model
+    print("Loading pretrained model...")
+    checkpoint = torch.load(args.pretrained_model, map_location=device)
+    
+    # Create base model
+    base_config = checkpoint.get('config', MPCGConfig())
+    codon_data = FiveSpeciesCodonData()
+    
+    base_model = MPCGCodon(
+        config=base_config,
+        v_aa=len(AA2ID),
+        v_codon=len(CODON2ID),
+        v_species=6,
+        codon_data=codon_data
+    ).to(device)
+    
+    # Load pretrained weights
+    base_model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Create SPEA config
+    spea_config = SPEAConfig(
+        d_model=base_config.d_model,
+        n_heads=base_config.n_heads,
+        dropout=0.1
+    )
+    
+    # Create SPEA fine-tuner
+    print("Creating SPEA fine-tuner...")
+    model = SPEAFineTuner(
+        base_model=base_model,
+        config=spea_config,
+        codon_data=codon_data,
+        freeze_base=args.freeze_base
+    ).to(device)
+    
+    # Prepare data
+    print("Preparing data...")
+    if not os.path.exists(args.data_file):
+        print("Generating training data...")
+        preparator = SecretionProteinDataPreparator()
+        base_data = preparator.prepare_training_data()
+        augmented_data = preparator.create_augmented_dataset(base_data, n_augment=args.n_augment)
+        augmented_data.to_csv(args.data_file, index=False)
+    
+    # Create dataset
+    dataset = SecretionProteinDataset(args.data_file)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=2
+    )
+    
+    # Optimizer
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.learning_rate,
+        weight_decay=0.01
+    )
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=1e-6
+    )
+    
+    # Training loop
