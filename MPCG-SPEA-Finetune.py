@@ -198,3 +198,113 @@ def train_spea(args):
     )
     
     # Training loop
+    print("Starting training...")
+    model.train()
+    
+    for epoch in range(args.epochs):
+        epoch_losses = []
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        
+        for batch in progress_bar:
+            # Move to device
+            aa_ids = batch['aa_ids'].to(device)
+            codon_ids = batch['codon_ids'].to(device)
+            position_labels = batch['position_labels'].to(device)
+            species_ids = batch['species_ids'].to(device)
+            aux_features = batch['aux_features'].to(device)
+            
+            # Create mask
+            mask = (aa_ids == 0)
+            
+            # Forward pass
+            outputs = model(
+                aa_ids=aa_ids,
+                mask=mask,
+                species_ids=species_ids,
+                aux_features=aux_features,
+                position_labels=position_labels,
+                target_codons=codon_ids
+            )
+            
+            loss = outputs['loss']
+            
+            if loss is not None:
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()),
+                    max_norm=1.0
+                )
+                
+                optimizer.step()
+                
+                # Record loss
+                epoch_losses.append(loss.item())
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'lr': f"{scheduler.get_last_lr()[0]:.6f}"
+                })
+        
+        # Learning rate scheduling
+        scheduler.step()
+        
+        # Print epoch statistics
+        avg_loss = np.mean(epoch_losses)
+        print(f"Epoch {epoch+1}: Average Loss = {avg_loss:.4f}")
+        
+        # Save checkpoint
+        if (epoch + 1) % args.save_freq == 0:
+            checkpoint_path = f"{args.output_dir}/spea_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': avg_loss,
+                'config': spea_config
+            }, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+    
+    # Save final model
+    final_path = f"{args.output_dir}/spea_final.pt"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': spea_config
+    }, final_path)
+    print(f"Training completed! Final model saved to {final_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fine-tune SPEA for secretion protein expression")
+    
+    parser.add_argument('--pretrained_model', type=str, required=True,
+                       help='Path to pretrained MPCG model')
+    parser.add_argument('--data_file', type=str, default='secretion_protein_data.csv',
+                       help='Path to training data CSV')
+    parser.add_argument('--output_dir', type=str, default='./spea_checkpoints',
+                       help='Output directory for checkpoints')
+    parser.add_argument('--epochs', type=int, default=20,
+                       help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=4,
+                       help='Batch size')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--n_augment', type=int, default=50,
+                       help='Number of augmentation samples per protein')
+    parser.add_argument('--freeze_base', action='store_true',
+                       help='Freeze base model parameters')
+    parser.add_argument('--save_freq', type=int, default=5,
+                       help='Save checkpoint every N epochs')
+    
+    args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Train
+    train_spea(args)
