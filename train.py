@@ -400,3 +400,170 @@ class MPCGCodonDataset(Dataset):
         
         return new_item
 
+
+# ==================== Collate Function (Enhanced) ====================
+def collate_fn(batch):
+    """Batch collation function (with length check)"""
+    aa_ids, codon_ids, sp_ids, aux_features, nucleotide_seqs, trna_ids = zip(*batch)
+    
+    # Check length consistency for each sample
+    valid_samples = []
+    for i in range(len(aa_ids)):
+        if len(aa_ids[i]) == len(codon_ids[i]) == len(trna_ids[i]):
+            valid_samples.append(i)
+        else:
+            logging.getLogger(__name__).warning(
+                f"Length mismatch in batch sample {i}: "
+                f"aa={len(aa_ids[i])}, codon={len(codon_ids[i])}, trna={len(trna_ids[i])}"
+            )
+    
+    # If no valid samples, return empty batch
+    if not valid_samples:
+        raise ValueError("No valid samples in batch")
+    
+    # Keep only valid samples
+    aa_ids = [aa_ids[i] for i in valid_samples]
+    codon_ids = [codon_ids[i] for i in valid_samples]
+    sp_ids = [sp_ids[i] for i in valid_samples]
+    aux_features = [aux_features[i] for i in valid_samples]
+    nucleotide_seqs = [nucleotide_seqs[i] for i in valid_samples]
+    trna_ids = [trna_ids[i] for i in valid_samples]
+    
+    # Pad sequences
+    aa_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in aa_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    codon_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in codon_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    nucleotide_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in nucleotide_seqs],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    trna_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in trna_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    # Convert to tensors
+    sp_tensor = torch.tensor(sp_ids, dtype=torch.long)
+    aux_tensor = torch.stack(aux_features)
+    
+    return aa_padded, codon_padded, sp_tensor, aux_tensor, nucleotide_padded, trna_padded
+
+def collate_fn(batch):
+    """Batch collation function"""
+    aa_ids, codon_ids, sp_ids, aux_features, nucleotide_seqs, trna_ids = zip(*batch)
+    
+    # Pad sequences
+    aa_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in aa_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    codon_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in codon_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    nucleotide_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in nucleotide_seqs],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    trna_padded = pad_sequence(
+        [torch.tensor(seq, dtype=torch.long) for seq in trna_ids],
+        batch_first=True,
+        padding_value=0
+    )
+    
+    # Convert to tensors
+    sp_tensor = torch.tensor(sp_ids, dtype=torch.long)
+    aux_tensor = torch.stack(aux_features)
+    
+    return aa_padded, codon_padded, sp_tensor, aux_tensor, nucleotide_padded, trna_padded
+
+
+
+# ==================== Synonymous Codon Mask (Fixed) ====================
+def apply_synonym_mask(logits: torch.Tensor, aa_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Apply synonymous codon mask (fixed version, handles length mismatch)
+    
+    Args:
+        logits: [B, L, V_codon] Model output
+        aa_ids: [B, L] or [B, L-2] Amino acid ID sequence
+    
+    Returns:
+        masked_logits: [B, L, V_codon]
+    """
+    B, L, V = logits.shape
+    B_aa, L_aa = aa_ids.shape
+    
+    # ✅ Debug info (optional)
+    logger = logging.getLogger(__name__)
+    
+    # ✅ Length alignment strategy
+    if L_aa == L - 2:
+        # aa_ids does not contain BOS/EOS, logits does
+        # Add placeholders
+        bos = torch.full((B, 1), 1, dtype=aa_ids.dtype, device=aa_ids.device)
+        eos = torch.full((B, 1), 2, dtype=aa_ids.dtype, device=aa_ids.device)
+        aa_ids_aligned = torch.cat([bos, aa_ids, eos], dim=1)
+    elif L_aa == L:
+        aa_ids_aligned = aa_ids
+    else:
+        # Other cases: truncate or pad
+        logger.warning(f"Unexpected length: logits={L}, aa_ids={L_aa}, adjusting...")
+        if L_aa > L:
+            aa_ids_aligned = aa_ids[:, :L]
+        else:
+            pad_len = L - L_aa
+            aa_ids_aligned = torch.cat([
+                aa_ids,
+                torch.zeros(B, pad_len, dtype=aa_ids.dtype, device=aa_ids.device)
+            ], dim=1)
+    
+    # ✅ Initialize mask
+    mask_value = get_mask_value(logits.dtype)
+    mask = torch.ones_like(logits) * mask_value
+    
+    # ✅ Safe indexing - ensure no out of bounds
+    for b in range(B):
+        for i in range(min(L, aa_ids_aligned.size(1))):  # Key fix: use min()
+            aa_id = aa_ids_aligned[b, i].item()
+            
+            if aa_id <= 2:  # Skip <pad>, <bos>, <eos>
+                continue
+            
+            aa = ID2AA.get(aa_id)
+            if aa and aa in SYN_CODON:
+                valid_codons = SYN_CODON[aa]
+                for codon in valid_codons:
+                    if codon in CODON2ID:
+                        codon_id = CODON2ID[codon]
+                        if codon_id < V:  # Boundary check
+                            mask[b, i, codon_id] = 0
+    
+    return logits + mask
+
+
+def get_mask_value(dtype: torch.dtype) -> float:
+    """Get dtype-safe mask value"""
+    if dtype in [torch.float16, torch.bfloat16]:
+        return -65000.0
+    else:
+        return -1e9
+
