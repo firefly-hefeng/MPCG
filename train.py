@@ -567,3 +567,123 @@ def get_mask_value(dtype: torch.dtype) -> float:
     else:
         return -1e9
 
+
+# ==================== Training Functions ====================
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scaler: Optional[GradScaler],
+    epoch: int,
+    logger: logging.Logger,
+    log_freq: int = 50
+) -> Dict[str, float]:
+    """Train one epoch"""
+    model.train()
+    
+    # Loss recorders
+    loss_meters = {
+        'total': AverageMeter(),
+        'ce': AverageMeter(),
+        'cai': AverageMeter(),
+        'rscu': AverageMeter(),
+        'gc': AverageMeter(),
+        'structure': AverageMeter(),
+        'dynamics': AverageMeter(),
+        'rare_codon': AverageMeter(),
+        'manufacturability': AverageMeter()
+    }
+    
+    start_time = time.time()
+    
+    for step, batch in enumerate(dataloader):
+        try:
+            # Move data to device
+            aa, codon, sp, aux, nucleotide, trna = [t.to(device) for t in batch]
+            
+            optimizer.zero_grad()
+            
+            # Mixed precision training
+            autocast_context = autocast('cuda', enabled=(scaler is not None)) if USE_NEW_AMP else autocast(enabled=(scaler is not None))
+            
+            with autocast_context:
+                # Forward pass
+                logits, features = model(
+                    aa_ids=aa,
+                    mask=(aa == 0),
+                    species_ids=sp,
+                    aux_features=aux,
+                    nucleotide_seq=nucleotide,
+                    trna_ids=trna,
+                    codon_ids=codon,
+                    return_features=True
+                )
+                
+            # ✅ Apply synonymous codon mask (auto handles length alignment)
+            try:
+                logits = apply_synonym_mask(logits, aa)
+            except Exception as e:
+                logger.error(f"Synonym mask error: {e}")
+                logger.error(f"Shapes - logits: {logits.shape}, aa: {aa.shape}, codon: {codon.shape}")
+                raise
+
+            # When computing loss, ensure dimension match
+            logits_core = logits[:, 1:-1, :]  # [B, L-2, V]
+
+            loss, loss_dict = criterion(
+                logits_core,
+                codon,  # Ensure codon is [B, L-2]
+                aa,     # Original amino acid sequence
+                sp,
+                features,
+                mask=(aa != 0)
+            )
+
+            
+            # Check NaN
+            if not torch.isfinite(loss):
+                logger.warning(f"Non-finite loss detected at step {step}, skipping...")
+                continue
+            
+            # Backward pass
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            
+            # Update statistics
+            batch_size = aa.size(0)
+            for key in loss_meters:
+                if key in loss_dict:
+                    loss_meters[key].update(loss_dict[key].item(), batch_size)
+            
+            # Print logs
+            if (step + 1) % log_freq == 0:
+                elapsed = time.time() - start_time
+                lr = optimizer.param_groups[0]['lr']
+                logger.info(
+                    f"Epoch [{epoch}][{step+1}/{len(dataloader)}] "
+                    f"Loss: {loss_meters['total'].avg:.4f} "
+                    f"(CE: {loss_meters['ce'].avg:.4f}, "
+                    f"CAI: {loss_meters['cai'].avg:.4f}, "
+                    f"RSCU: {loss_meters['rscu'].avg:.4f}) "
+                    f"LR: {lr:.2e} "
+                    f"Time: {elapsed:.1f}s"
+                )
+        
+        except Exception as e:
+            logger.error(f"Error in training step {step}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Return average losses
+    return {k: v.avg for k, v in loss_meters.items()}
