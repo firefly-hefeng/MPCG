@@ -687,3 +687,92 @@ def train_epoch(
     
     # Return average losses
     return {k: v.avg for k, v in loss_meters.items()}
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    logger: logging.Logger
+) -> Tuple[float, Dict[str, float]]:
+    """Validation"""
+    model.eval()
+    
+    loss_meters = {
+        'total': AverageMeter(),
+        'ce': AverageMeter(),
+        'cai': AverageMeter(),
+        'rscu': AverageMeter()
+    }
+    
+    for batch in dataloader:
+        try:
+            aa, codon, sp, aux, nucleotide, trna = [t.to(device) for t in batch]
+            
+            logits, features = model(
+                aa, (aa == 0), sp, aux,
+                nucleotide, trna, codon,
+                return_features=True
+            )
+            
+            logits = apply_synonym_mask(logits, aa)
+            
+            loss, loss_dict = criterion(
+                logits[:, 1:-1], codon, aa, sp,
+                features, mask=(aa != 0)
+            )
+            
+            batch_size = aa.size(0)
+            for key in loss_meters:
+                if key in loss_dict:
+                    loss_meters[key].update(loss_dict[key].item(), batch_size)
+        
+        except Exception as e:
+            logger.error(f"Validation error: {str(e)}")
+            continue
+    
+    metrics = {k: v.avg for k, v in loss_meters.items()}
+    return metrics['total'], metrics
+
+
+# ==================== Save and Load ====================
+def save_checkpoint(
+    state: Dict,
+    is_best: bool,
+    save_dir: str,
+    filename: str = 'checkpoint.pt'
+):
+    """Save checkpoint"""
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, filename)
+    torch.save(state, filepath)
+    
+    if is_best:
+        best_filepath = os.path.join(save_dir, 'best.pt')
+        torch.save(state, best_filepath)
+
+
+def load_checkpoint(
+    filepath: str,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional = None
+) -> Tuple[int, float]:
+    """Load checkpoint"""
+    checkpoint = torch.load(filepath, map_location='cpu', weights_only=False)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    epoch = checkpoint.get('epoch', 0)
+    best_loss = checkpoint.get('best_loss', float('inf'))
+    
+    return epoch, best_loss
+
