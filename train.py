@@ -776,3 +776,158 @@ def load_checkpoint(
     
     return epoch, best_loss
 
+
+# ==================== Main Function ====================
+def main():
+    parser = argparse.ArgumentParser(description="MPCG-Codon Training")
+    
+    # Data arguments
+    parser.add_argument('--data_csv', type=str, required=True,
+                       help='Path to training data CSV file')
+    parser.add_argument('--max_seq_len', type=int, default=2000,
+                       help='Maximum sequence length')
+    
+    # Model arguments
+    parser.add_argument('--d_model', type=int, default=512,
+                       help='Model dimension')
+    parser.add_argument('--n_layers', type=int, default=12,
+                       help='Number of Transformer layers')
+    parser.add_argument('--n_heads', type=int, default=8,
+                       help='Number of attention heads')
+    parser.add_argument('--d_ff', type=int, default=2048,
+                       help='Feed-forward network dimension')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                       help='Dropout rate')
+    
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--warmup_steps', type=int, default=4000,
+                       help='Number of warmup steps')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                       help='Weight decay')
+    
+    # Loss weights
+    parser.add_argument('--weight_ce', type=float, default=1.0)
+    parser.add_argument('--weight_cai', type=float, default=0.4)
+    parser.add_argument('--weight_rscu', type=float, default=0.3)
+    parser.add_argument('--weight_gc', type=float, default=0.1)
+    parser.add_argument('--weight_structure', type=float, default=0.15)
+    parser.add_argument('--weight_dynamics', type=float, default=0.1)
+    parser.add_argument('--weight_rare_codon', type=float, default=0.2)
+    parser.add_argument('--weight_manufact', type=float, default=0.05)
+    
+    # Other arguments
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Training device')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                       help='Model save directory')
+    parser.add_argument('--log_dir', type=str, default='./logs',
+                       help='Log directory')
+    parser.add_argument('--log_freq', type=int, default=50,
+                       help='Log printing frequency')
+    parser.add_argument('--val_freq', type=int, default=1,
+                       help='Validation frequency (every N epochs)')
+    parser.add_argument('--patience', type=int, default=10,
+                       help='Early stopping patience')
+    parser.add_argument('--resume', type=str, default='',
+                       help='Checkpoint path to resume training from')
+    parser.add_argument('--wandb', action='store_true',
+                       help='Use WandB logging')
+    parser.add_argument('--wandb_project', type=str, default='mpcg-codon',
+                       help='WandB project name')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logger = setup_logging(args.log_dir)
+    logger.info("="*80)
+    logger.info("MPCG-Codon Training")
+    logger.info("="*80)
+    
+    # Set random seed
+    set_seed(args.seed)
+    logger.info(f"Random seed: {args.seed}")
+    
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # WandB initialization
+    if args.wandb and HAS_WANDB:
+        wandb.init(
+            project=args.wandb_project,
+            config=vars(args),
+            name=f"mpcg_d{args.d_model}_l{args.n_layers}_bs{args.batch_size}"
+        )
+        logger.info("WandB initialized")
+    
+    # ==================== Load Data ====================
+    logger.info("Loading data...")
+    df = pd.read_csv(args.data_csv)
+    logger.info(f"Loaded {len(df)} sequences from {args.data_csv}")
+    
+    # Initialize codon data
+    codon_data = FiveSpeciesCodonData()
+    logger.info(f"Initialized codon data for {len(codon_data.species_list)} species:")
+    for species in codon_data.species_list:
+        logger.info(f"  - {species}")
+    
+    # Process sequences
+    aa_sequences = []
+    for seq in df['RefSeq_aa']:
+        seq_upper = seq.upper()
+        if not seq_upper.endswith('*'):
+            seq_upper += '*'
+        aa_sequences.append(list(seq_upper))
+    
+    nn_sequences = [seq.upper() for seq in df['RefSeq_nn']]
+    organism_list = df['Organism'].tolist()
+    
+    # Create dataset
+    logger.info("Creating dataset...")
+    full_dataset = MPCGCodonDataset(
+        aa_sequences,
+        nn_sequences,
+        organism_list,
+        codon_data,
+        max_length=args.max_seq_len,
+        augment=True
+    )
+    
+    # Split into training and validation sets
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
+    
+    logger.info(f"Train samples: {len(train_dataset)}")
+    logger.info(f"Validation samples: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
