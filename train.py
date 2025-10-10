@@ -931,3 +931,186 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True
     )
+    
+    # ==================== Create Model ====================
+    logger.info("Creating model...")
+    
+    config = MPCGConfig(
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        dropout=args.dropout,
+        max_seq_len=args.max_seq_len,
+        aux_dim=64
+    )
+    
+    model = MPCGCodon(
+        config=config,
+        v_aa=len(AA_TOKENS),
+        v_codon=len(CODON_TOKENS),
+        v_species=len(full_dataset.sp2id),
+        codon_data=codon_data
+    ).to(device)
+    
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model parameters: {n_params:,} (trainable: {n_trainable:,})")
+    
+    # ==================== Loss Function ====================
+    loss_weights = {
+        'ce': args.weight_ce,
+        'cai': args.weight_cai,
+        'rscu': args.weight_rscu,
+        'gc': args.weight_gc,
+        'structure': args.weight_structure,
+        'dynamics': args.weight_dynamics,
+        'rare_codon': args.weight_rare_codon,
+        'manufacturability': args.weight_manufact
+    }
+    
+    criterion = BiologicallyInformedLoss(
+        codon_data=codon_data,
+        weights=loss_weights,
+        device=device
+    )
+    
+    logger.info("Loss weights:")
+    for k, v in loss_weights.items():
+        logger.info(f"  {k}: {v}")
+    
+    # ==================== Optimizer ====================
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.98),
+        eps=1e-9,
+        weight_decay=args.weight_decay
+    )
+    
+    # Learning rate scheduler (cosine annealing with warmup)
+    total_steps = args.epochs * len(train_loader)
+    
+    def lr_lambda(step):
+        if step < args.warmup_steps:
+            return step / args.warmup_steps
+        else:
+            progress = (step - args.warmup_steps) / (total_steps - args.warmup_steps)
+            return 0.5 * (1 + np.cos(np.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Mixed precision training
+    scaler = GradScaler('cuda') if device.type == 'cuda' and USE_NEW_AMP else (
+        GradScaler() if device.type == 'cuda' else None
+    )
+    
+    # ==================== Resume Training ====================
+    start_epoch = 1
+    best_val_loss = float('inf')
+    
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        start_epoch, best_val_loss = load_checkpoint(
+            args.resume, model, optimizer, scheduler
+        )
+        start_epoch += 1
+        logger.info(f"Resumed from epoch {start_epoch-1}, best loss: {best_val_loss:.4f}")
+    
+    # ==================== Training Loop ====================
+    logger.info("Starting training...")
+    logger.info("="*80)
+    
+    patience_counter = 0
+    
+    for epoch in range(start_epoch, args.epochs + 1):
+        logger.info(f"\nEpoch {epoch}/{args.epochs}")
+        logger.info("-" * 80)
+        
+        # Training
+        train_losses = train_epoch(
+            model, train_loader, criterion, optimizer,
+            device, scaler, epoch, logger, args.log_freq
+        )
+        
+        # Learning rate scheduling
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Validation
+        if epoch % args.val_freq == 0:
+            val_loss, val_metrics = validate(
+                model, val_loader, criterion, device, logger
+            )
+            
+            logger.info(f"\nEpoch {epoch} Summary:")
+            logger.info(f"  Train Loss: {train_losses['total']:.4f}")
+            logger.info(f"    - CE: {train_losses['ce']:.4f}")
+            logger.info(f"    - CAI: {train_losses['cai']:.4f}")
+            logger.info(f"    - RSCU: {train_losses['rscu']:.4f}")
+            logger.info(f"    - Rare Codon: {train_losses['rare_codon']:.4f}")
+            logger.info(f"  Val Loss: {val_loss:.4f}")
+            logger.info(f"  Learning Rate: {current_lr:.2e}")
+            
+            # WandB logging
+            if args.wandb and HAS_WANDB:
+                wandb.log({
+                    'epoch': epoch,
+                    'train/total': train_losses['total'],
+                    'train/ce': train_losses['ce'],
+                    'train/cai': train_losses['cai'],
+                    'train/rscu': train_losses['rscu'],
+                    'train/gc': train_losses['gc'],
+                    'train/structure': train_losses['structure'],
+                    'train/dynamics': train_losses['dynamics'],
+                    'train/rare_codon': train_losses['rare_codon'],
+                    'train/manufacturability': train_losses['manufacturability'],
+                    'val/loss': val_loss,
+                    'val/ce': val_metrics['ce'],
+                    'val/cai': val_metrics['cai'],
+                    'val/rscu': val_metrics['rscu'],
+                    'lr': current_lr
+                })
+            
+            # Save checkpoint
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                patience_counter = 0
+                logger.info(f"  *** New best model! Val loss: {val_loss:.4f} ***")
+            else:
+                patience_counter += 1
+                logger.info(f"  No improvement for {patience_counter}/{args.patience} epochs")
+            
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss': val_loss,
+                'best_loss': best_val_loss,
+                'config': config,
+                'args': vars(args)
+            }
+            
+            save_checkpoint(checkpoint, is_best, args.save_dir, f'epoch_{epoch}.pt')
+            save_checkpoint(checkpoint, False, args.save_dir, 'last.pt')
+            
+            # Early stopping
+            if patience_counter >= args.patience:
+                logger.info(f"\nEarly stopping triggered after {patience_counter} epochs without improvement")
+                break
+    
+    # ==================== Training Completed ====================
+    logger.info("\n" + "="*80)
+    logger.info("Training completed!")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Best model saved to: {os.path.join(args.save_dir, 'best.pt')}")
+    logger.info("="*80)
+    
+    if args.wandb and HAS_WANDB:
+        wandb.finish()
+
+
+if __name__ == '__main__':
+    main()
